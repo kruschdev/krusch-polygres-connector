@@ -152,4 +152,80 @@ export class WondersearchBridge {
     this.driveCache.set(driveName, newDrive.id);
     return newDrive.id;
   }
+
+  /**
+   * Synchronize Authority Packs (.yaml) or legal statute files into Wondersearch
+   */
+  async syncAuthorityPacks(packsDir, driveName = 'repo-krusch-law-statutes') {
+    const fs = await import('fs');
+    const path = await import('path');
+    const driveId = await this.createOrGetDrive(driveName);
+
+    if (!fs.existsSync(packsDir)) {
+      throw new Error(`Authority packs directory not found: ${packsDir}`);
+    }
+
+    const files = fs.readdirSync(packsDir, { recursive: true })
+      .filter(f => typeof f === 'string' && (f.endsWith('.yaml') || f.endsWith('.yml') || f.endsWith('.json')));
+
+    let count = 0;
+    for (const relFile of files) {
+      const fullPath = path.join(packsDir, relFile);
+      const text = fs.readFileSync(fullPath, 'utf8');
+      await this.ingestDocument({
+        driveId,
+        externalId: `law://${relFile}`,
+        text,
+        metadata: { domain: 'law', file_path: relFile }
+      });
+      count++;
+    }
+    return { driveId, documentsIndexed: count };
+  }
+
+  /**
+   * Synchronize commercial contract playbooks and templates into Wondersearch
+   */
+  async syncPlaybooks(playbooksDir, driveName = 'repo-krusch-biz-playbooks') {
+    const fs = await import('fs');
+    const path = await import('path');
+    const driveId = await this.createOrGetDrive(driveName);
+
+    if (!fs.existsSync(playbooksDir)) {
+      throw new Error(`Playbooks directory not found: ${playbooksDir}`);
+    }
+
+    const files = fs.readdirSync(playbooksDir, { recursive: true })
+      .filter(f => typeof f === 'string' && (f.endsWith('.md') || f.endsWith('.txt') || f.endsWith('.json') || f.endsWith('.yaml')));
+
+    let count = 0;
+    for (const relFile of files) {
+      const fullPath = path.join(playbooksDir, relFile);
+      const text = fs.readFileSync(fullPath, 'utf8');
+      await this.ingestDocument({
+        driveId,
+        externalId: `biz://${relFile}`,
+        text,
+        metadata: { domain: 'biz', file_path: relFile }
+      });
+      count++;
+    }
+    return { driveId, documentsIndexed: count };
+  }
+
+  /**
+   * Search statutes across the KruschLaw Wondersearch drive
+   */
+  async searchLaw(query, options = {}) {
+    const driveId = await this.createOrGetDrive(options.driveName || 'repo-krusch-law-statutes');
+    return this.search({ driveId, query, ...options });
+  }
+
+  /**
+   * Search commercial clauses across the KruschBiz Wondersearch drive
+   */
+  async searchBiz(query, options = {}) {
+    const driveId = await this.createOrGetDrive(options.driveName || 'repo-krusch-biz-playbooks');
+    return this.search({ driveId, query, ...options });
+  }
 }

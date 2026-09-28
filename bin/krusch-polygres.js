@@ -78,6 +78,54 @@ async function main() {
         break;
       }
 
+      case 'sync-law': {
+        const packsDir = args[0] || '/home/krusch/homelab/projects/krusch-law/data';
+        console.log(`Syncing Authority Packs & statutes from '${packsDir}' to Wondersearch...`);
+        const res = await connector.wondersearch.syncAuthorityPacks(packsDir);
+        console.log(`✅ Indexed ${res.documentsIndexed} statutory documents into Wondersearch drive '${res.driveId}'.`);
+        break;
+      }
+
+      case 'sync-biz': {
+        const playbooksDir = args[0] || '/home/krusch/homelab/projects/krusch-biz/data';
+        console.log(`Syncing commercial playbooks from '${playbooksDir}' to Wondersearch...`);
+        const res = await connector.wondersearch.syncPlaybooks(playbooksDir);
+        console.log(`✅ Indexed ${res.documentsIndexed} playbook documents into Wondersearch drive '${res.driveId}'.`);
+        break;
+      }
+
+      case 'search-law': {
+        const query = args.join(' ');
+        if (!query) {
+          console.error('Error: specify a legal query: krusch-polygres search-law <query>');
+          process.exit(1);
+        }
+        console.log(`Searching statutes for "${query}" via Wondersearch...`);
+        const res = await connector.wondersearch.searchLaw(query);
+        console.log(`Found ${res.results.length} results:`);
+        for (const r of res.results) {
+          console.log(`\n⚖️ ${r.externalId} (score: ${r.score}):`);
+          console.log(r.text.substring(0, 200) + '...\n');
+        }
+        break;
+      }
+
+      case 'search-biz': {
+        const query = args.join(' ');
+        if (!query) {
+          console.error('Error: specify a commercial query: krusch-polygres search-biz <query>');
+          process.exit(1);
+        }
+        console.log(`Searching commercial clauses for "${query}" via Wondersearch...`);
+        const res = await connector.wondersearch.searchBiz(query);
+        console.log(`Found ${res.results.length} results:`);
+        for (const r of res.results) {
+          console.log(`\n💼 ${r.externalId} (score: ${r.score}):`);
+          console.log(r.text.substring(0, 200) + '...\n');
+        }
+        break;
+      }
+
       default: {
         console.log(`
 @krusch/polygres-connector CLI
@@ -87,6 +135,10 @@ Usage:
   krusch-polygres pull-context [workspace]
   krusch-polygres sync-git <repo_name>
   krusch-polygres search-code <repo_name> <query>
+  krusch-polygres sync-law [packs_dir]
+  krusch-polygres sync-biz [playbooks_dir]
+  krusch-polygres search-law <query>
+  krusch-polygres search-biz <query>
         `);
       }
     }

@@ -60,3 +60,21 @@ test('createPolygresConnector factory bundles all bridges', async () => {
 
   await connector.close();
 });
+
+test('WondersearchBridge syncAuthorityPacks validates directory existence', async () => {
+  const bridge = new WondersearchBridge({ wondersearchApiKey: 'dummy_key', wondersearchWorkspaceId: 'ws_1' });
+  bridge.createOrGetDrive = async () => 'mock_drive_1';
+
+  await assert.rejects(async () => {
+    await bridge.syncAuthorityPacks('/tmp/nonexistent_authority_packs_dir');
+  }, /Authority packs directory not found/);
+});
+
+test('WondersearchBridge syncPlaybooks validates directory existence', async () => {
+  const bridge = new WondersearchBridge({ wondersearchApiKey: 'dummy_key', wondersearchWorkspaceId: 'ws_1' });
+  bridge.createOrGetDrive = async () => 'mock_drive_2';
+
+  await assert.rejects(async () => {
+    await bridge.syncPlaybooks('/tmp/nonexistent_playbooks_dir');
+  }, /Playbooks directory not found/);
+});

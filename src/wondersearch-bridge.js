@@ -11,7 +11,7 @@ import { assertCloudAllowed, assertMatterNotPrivileged } from './config.js';
 
 export class WondersearchBridge {
   constructor(config = {}) {
-    this.apiKey = config.wondersearchApiKey || process.env.WONDERSEARCH_API_KEY;
+    this.apiKey = config.wondersearchApiKey !== undefined ? config.wondersearchApiKey : (process.env.WONDERSEARCH_API_KEY || null);
     this.baseUrl = (config.wondersearchBaseUrl || process.env.WONDERSEARCH_BASE_URL || 'https://api.wondersearch.ai').replace(/\/+$/, '');
     this.workspaceId = config.wondersearchWorkspaceId || process.env.WONDERSEARCH_WORKSPACE_ID || null;
     this.defaultDriveId = config.wondersearchDefaultDriveId || process.env.WONDERSEARCH_DEFAULT_DRIVE_ID || null;
@@ -169,13 +169,17 @@ export class WondersearchBridge {
 
     const url = `${this.baseUrl}/v1/drives/${driveId}/documents`;
     const payload = {
-      external_id: externalId,
-      text,
-      metadata: {
-        ...metadata,
-        indexed_by: '@krusch/polygres-connector',
-        indexed_at: new Date().toISOString()
-      }
+      documents: [
+        {
+          external_id: externalId,
+          text,
+          metadata: {
+            ...metadata,
+            indexed_by: '@krusch/polygres-connector',
+            indexed_at: new Date().toISOString()
+          }
+        }
+      ]
     };
 
     const res = await this._fetchWithRetry(url, {

@@ -149,6 +149,24 @@ export function maskToken(token) {
 }
 
 export function loadConfig(overrides = {}) {
+  // Lightweight .env loader if .env exists in cwd
+  const envPath = path.resolve(process.cwd(), '.env');
+  if (fs.existsSync(envPath)) {
+    try {
+      const lines = fs.readFileSync(envPath, 'utf8').split('\n');
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#') || !trimmed.includes('=')) continue;
+        const [k, ...v] = trimmed.split('=');
+        const key = k.trim();
+        const val = v.join('=').trim().replace(/^["']|["']$/g, '');
+        if (!process.env[key]) {
+          process.env[key] = val;
+        }
+      }
+    } catch {}
+  }
+
   const polygresUrl = overrides.polygresUrl || process.env.POLYGRES_URL || process.env.DATABASE_URL || null;
   const polygresApiKey = overrides.polygresApiKey || process.env.POLYGRES_API_KEY || null;
 

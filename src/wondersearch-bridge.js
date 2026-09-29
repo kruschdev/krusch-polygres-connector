@@ -14,6 +14,7 @@ export class WondersearchBridge {
     this.apiKey = config.wondersearchApiKey || process.env.WONDERSEARCH_API_KEY;
     this.baseUrl = (config.wondersearchBaseUrl || process.env.WONDERSEARCH_BASE_URL || 'https://api.wondersearch.ai').replace(/\/+$/, '');
     this.workspaceId = config.wondersearchWorkspaceId || process.env.WONDERSEARCH_WORKSPACE_ID || null;
+    this.defaultDriveId = config.wondersearchDefaultDriveId || process.env.WONDERSEARCH_DEFAULT_DRIVE_ID || null;
     this.allowCloud = config.allowCloud;
     this.timeoutMs = config.timeoutMs || 15000;
     this.concurrency = config.concurrency || 6;
@@ -38,7 +39,7 @@ export class WondersearchBridge {
     if (idempotencyKey) {
       headers['Idempotency-Key'] = idempotencyKey;
     } else {
-      headers['Idempotency-Key'] = `krusch-${crypto.randomBytes(8).toString('hex')}`;
+      headers['Idempotency-Key'] = crypto.randomUUID();
     }
     return headers;
   }
@@ -80,12 +81,34 @@ export class WondersearchBridge {
   }
 
   /**
+   * Resolve workspace ID and default drive ID from Wondersearch API /v1/sdk/context if not preconfigured
+   */
+  async getWorkspaceContext() {
+    if (this.workspaceId && this.defaultDriveId) {
+      return { workspaceId: this.workspaceId, defaultDriveId: this.defaultDriveId };
+    }
+    const res = await this._fetchWithRetry(`${this.baseUrl}/v1/sdk/context`, {
+      headers: this._headers()
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (!this.workspaceId && data.workspace_id) this.workspaceId = data.workspace_id;
+      if (!this.defaultDriveId && data.default_drive_id) this.defaultDriveId = data.default_drive_id;
+    }
+    return { workspaceId: this.workspaceId, defaultDriveId: this.defaultDriveId };
+  }
+
+  /**
    * Search a drive or default workspace drive
    */
   async search({ driveId, query, effort = 'medium', limit = 5, groupByDocument = true, folderId = null }) {
+    if (!driveId && !this.workspaceId) {
+      await this.getWorkspaceContext().catch(() => {});
+    }
+    const targetDriveId = driveId || this.defaultDriveId;
     let url;
-    if (driveId) {
-      url = `${this.baseUrl}/v1/drives/${driveId}/search`;
+    if (targetDriveId) {
+      url = `${this.baseUrl}/v1/drives/${targetDriveId}/search`;
     } else if (this.workspaceId) {
       url = `${this.baseUrl}/v1/workspaces/${this.workspaceId}/search`;
     } else {
@@ -178,6 +201,9 @@ export class WondersearchBridge {
       return this.driveCache.get(driveName);
     }
     if (!this.workspaceId) {
+      await this.getWorkspaceContext().catch(() => {});
+    }
+    if (!this.workspaceId) {
       throw new Error('createOrGetDrive() requires WONDERSEARCH_WORKSPACE_ID.');
     }
 
@@ -188,7 +214,8 @@ export class WondersearchBridge {
 
     if (listRes.ok) {
       const listData = await listRes.json();
-      const match = (listData.drives || []).find(d => d.name === driveName);
+      const drives = listData.data || listData.drives || [];
+      const match = drives.find(d => d.name === driveName);
       if (match) {
         this.driveCache.set(driveName, match.id);
         return match.id;
@@ -207,7 +234,8 @@ export class WondersearchBridge {
       const retryListRes = await this._fetchWithRetry(listUrl, { headers: this._headers() });
       if (retryListRes.ok) {
         const retryData = await retryListRes.json();
-        const match = (retryData.drives || []).find(d => d.name === driveName);
+        const drives = retryData.data || retryData.drives || [];
+        const match = drives.find(d => d.name === driveName);
         if (match) {
           this.driveCache.set(driveName, match.id);
           return match.id;

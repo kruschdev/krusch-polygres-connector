@@ -114,19 +114,25 @@ export function createPolygresConnector(options = {}) {
       }
 
       // 4. Wondersearch probe
-      if (config.wondersearchApiKey && config.wondersearchWorkspaceId) {
+      if (config.wondersearchApiKey) {
         try {
-          const listUrl = `${wondersearch.baseUrl}/v1/workspaces/${config.wondersearchWorkspaceId}/drives`;
-          const wsRes = await fetch(listUrl, {
-            headers: wondersearch._headers(),
-            signal: AbortSignal.timeout(5000)
-          });
-          if (wsRes.ok) {
-            const data = await wsRes.json();
-            report.wondersearch.ok = true;
-            report.wondersearch.drives = (data.drives || []).length;
+          const wsContext = await wondersearch.getWorkspaceContext().catch(() => ({}));
+          const targetWorkspaceId = config.wondersearchWorkspaceId || wsContext.workspaceId;
+          if (targetWorkspaceId) {
+            const listUrl = `${wondersearch.baseUrl}/v1/workspaces/${targetWorkspaceId}/drives`;
+            const wsRes = await fetch(listUrl, {
+              headers: wondersearch._headers(),
+              signal: AbortSignal.timeout(5000)
+            });
+            if (wsRes.ok) {
+              const data = await wsRes.json();
+              report.wondersearch.ok = true;
+              report.wondersearch.drives = (data.data || data.drives || []).length;
+            } else {
+              report.wondersearch.error = `HTTP ${wsRes.status}`;
+            }
           } else {
-            report.wondersearch.error = `HTTP ${wsRes.status}`;
+            report.wondersearch.error = 'No workspace configured or resolvable';
           }
         } catch (err) {
           report.wondersearch.error = err.message;

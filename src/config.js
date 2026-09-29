@@ -174,6 +174,7 @@ export function loadConfig(overrides = {}) {
   const wondersearchApiKey = overrides.wondersearchApiKey || process.env.WONDERSEARCH_API_KEY || null;
   const wondersearchBaseUrl = (overrides.wondersearchBaseUrl || process.env.WONDERSEARCH_BASE_URL || 'https://api.wondersearch.ai').replace(/\/+$/, '');
   const wondersearchWorkspaceId = overrides.wondersearchWorkspaceId || process.env.WONDERSEARCH_WORKSPACE_ID || null;
+  const wondersearchDefaultDriveId = overrides.wondersearchDefaultDriveId || process.env.WONDERSEARCH_DEFAULT_DRIVE_ID || null;
 
   const localContextDbPath = overrides.localContextDbPath || process.env.KRUSCH_CONTEXT_DB_PATH || path.resolve(process.cwd(), '.agent/context.db');
   const localGitDbUrl = overrides.localGitDbUrl || process.env.KRUSCH_GIT_DATABASE_URL || 'postgresql://kdcode:password@localhost:5432/kdcode';
@@ -188,6 +189,7 @@ export function loadConfig(overrides = {}) {
     wondersearchApiKey,
     wondersearchBaseUrl,
     wondersearchWorkspaceId,
+    wondersearchDefaultDriveId,
     localContextDbPath,
     localGitDbUrl,
     allowCloud,

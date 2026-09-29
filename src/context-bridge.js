@@ -173,13 +173,37 @@ export class ContextBridge {
     let db;
     try {
       db = new DatabaseSync(this.contextDbPath);
-      const stmt = db.prepare(`
-        SELECT id, category, content, status, parent_id, superseded_by, created_at, metadata
-        FROM context_items
-        ORDER BY id ASC
-      `);
-      const rows = stmt.all();
-      return rows;
+      // Check which table exists: ide_agent_memory or context_items
+      const tableCheck = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('ide_agent_memory', 'context_items')").all();
+      const tableNames = new Set(tableCheck.map(t => t.name));
+
+      if (tableNames.has('ide_agent_memory')) {
+        const stmt = db.prepare(`
+          SELECT id, category, content, status, supersedes_id, superseded_by, invalidated_reason, created_at, tags
+          FROM ide_agent_memory
+          ORDER BY id ASC
+        `);
+        const rows = stmt.all();
+        return rows.map(r => ({
+          id: r.id,
+          category: r.category,
+          content: r.content,
+          status: (r.status || 'active').toLowerCase(),
+          parent_id: r.supersedes_id || null,
+          superseded_by: r.superseded_by || null,
+          justification: r.invalidated_reason || null,
+          created_at: r.created_at,
+          metadata: { tags: r.tags || [] }
+        }));
+      } else if (tableNames.has('context_items')) {
+        const stmt = db.prepare(`
+          SELECT id, category, content, status, parent_id, superseded_by, created_at, metadata
+          FROM context_items
+          ORDER BY id ASC
+        `);
+        return stmt.all();
+      }
+      return [];
     } catch (err) {
       throw new Error(`[ContextBridge] Local SQLite database at '${this.contextDbPath}' corrupt or unreadable: ${err.message}`);
     } finally {
@@ -380,11 +404,92 @@ export class ContextBridge {
     const res = await pool.query(`
       SELECT local_id, category, content, status, parent_id, superseded_by, created_at, metadata
       FROM pg_context_items
-      WHERE source_workspace = $1 AND status = 'active'
+      WHERE (source_workspace = $1 OR $1 = '*') AND status = 'active'
       ORDER BY category ASC, local_id ASC
     `, [workspaceName]);
 
+    if (res.rows.length === 0) {
+      try {
+        const memCheck = await pool.query("SELECT to_regclass('ide_agent_memory') as tbl;");
+        if (memCheck.rows[0]?.tbl) {
+          const altRes = await pool.query(`
+            SELECT id as local_id, category, content, LOWER(status) as status,
+                   supersedes_id as parent_id, superseded_by, created_at,
+                   json_build_object('tags', tags) as metadata
+            FROM ide_agent_memory
+            WHERE (project = $1 OR $1 = '*' OR $1 = 'default' OR $1 = 'homelab')
+              AND UPPER(status) = 'ACTIVE'
+            ORDER BY category ASC, id ASC;
+          `, [workspaceName]);
+          return altRes.rows;
+        }
+      } catch {}
+    }
+
     return res.rows;
+  }
+
+  /**
+   * Search active invariants, decisions, or blockers from PostgreSQL matching text or category
+   */
+  async queryRemoteContext({ workspaceName = 'homelab', query = '', category = null, limit = 50 } = {}) {
+    const pool = this._getPool();
+    await this.initializeRemoteSchema();
+
+    let sql = `
+      SELECT local_id, category, content, status, parent_id, superseded_by, created_at, metadata
+      FROM pg_context_items
+      WHERE (source_workspace = $1 OR $1 = '*') AND status = 'active'
+    `;
+    const params = [workspaceName];
+
+    if (query) {
+      sql += ` AND content ILIKE $${params.length + 1}`;
+      params.push(`%${query}%`);
+    }
+
+    if (category) {
+      sql += ` AND category = $${params.length + 1}`;
+      params.push(category);
+    }
+
+    const cappedLimit = Math.min(Math.max(1, limit), 200);
+    sql += ` ORDER BY category ASC, local_id ASC LIMIT $${params.length + 1};`;
+    params.push(cappedLimit);
+
+    const res = await pool.query(sql, params);
+    if (res.rows.length > 0) return res.rows;
+
+    // Fallback to ide_agent_memory if pg_context_items has no matches
+    try {
+      const memCheck = await pool.query("SELECT to_regclass('ide_agent_memory') as tbl;");
+      if (memCheck.rows[0]?.tbl) {
+        let altSql = `
+          SELECT id as local_id, category, content, LOWER(status) as status,
+                 supersedes_id as parent_id, superseded_by, created_at,
+                 json_build_object('tags', tags) as metadata
+          FROM ide_agent_memory
+          WHERE (project = $1 OR $1 = '*' OR $1 = 'default' OR $1 = 'homelab')
+            AND UPPER(status) = 'ACTIVE'
+        `;
+        const altParams = [workspaceName];
+        if (query) {
+          altSql += ` AND content ILIKE $${altParams.length + 1}`;
+          altParams.push(`%${query}%`);
+        }
+        if (category) {
+          altSql += ` AND category = $${altParams.length + 1}`;
+          altParams.push(category);
+        }
+        altSql += ` ORDER BY category ASC, id ASC LIMIT $${altParams.length + 1};`;
+        altParams.push(cappedLimit);
+
+        const altRes = await pool.query(altSql, altParams);
+        return altRes.rows;
+      }
+    } catch {}
+
+    return [];
   }
 
   /**

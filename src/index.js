@@ -142,6 +142,200 @@ export function createPolygresConnector(options = {}) {
       return report;
     },
 
+    /**
+     * Cross-substrate bridge combining pgGraph (AST symbol + caller/callee CTE)
+     * with KruschContext (active steering invariants, decisions, and blockers).
+     */
+    async getSymbolContext({ repoName, symbolName, sha = null, workspaceName = null }) {
+      if (!repoName || !symbolName) {
+        throw new Error('getSymbolContext() requires both repoName and symbolName');
+      }
+      const targetWorkspace = workspaceName || repoName;
+
+      // 1. AST Symbol declaration from pg_git_symbols
+      const symbol = await git.findSymbol(repoName, symbolName, { sha });
+
+      // 2. Caller-callee graph from pgGraph recursive CTE
+      const dependencyGraph = await git.getDependencyGraph(repoName, symbolName);
+      const inboundCallers = dependencyGraph.inboundCallers || [];
+      const outboundCallees = dependencyGraph.outboundCallees || [];
+      const blastRadius = inboundCallers.length;
+
+      // 3. Relevant invariants from pg_context_items
+      const symbolQuery = symbolName.replace(/^[./\\]+/, '');
+      const filePath = symbol?.file_path || '';
+
+      const [symbolInvariants, fileInvariants, generalInvariants, activeBlockers] = await Promise.all([
+        context.queryRemoteContext({ workspaceName: targetWorkspace, query: symbolQuery, category: 'invariant', limit: 20 }),
+        filePath ? context.queryRemoteContext({ workspaceName: targetWorkspace, query: filePath, limit: 20 }) : Promise.resolve([]),
+        context.queryRemoteContext({ workspaceName: targetWorkspace, category: 'invariant', limit: 20 }),
+        context.queryRemoteContext({ workspaceName: targetWorkspace, query: symbolQuery, category: 'blocker', limit: 10 })
+      ]);
+
+      // Deduplicate items
+      const seenIds = new Set();
+      const uniqueContext = [];
+      for (const item of [...symbolInvariants, ...fileInvariants]) {
+        const key = `${item.category}:${item.local_id || item.id}`;
+        if (!seenIds.has(key)) {
+          seenIds.add(key);
+          uniqueContext.push(item);
+        }
+      }
+
+      // 4. Invariant audit and warnings
+      const warnings = [];
+      const requiresCallerAudit = blastRadius > 0;
+      if (requiresCallerAudit) {
+        warnings.push(
+          `[InvariantRule] Symbol '${symbolName}' has ${blastRadius} inbound caller(s). Project rule requires AST caller verification before signature or behavior changes.`
+        );
+      }
+      if (activeBlockers.length > 0) {
+        for (const b of activeBlockers) {
+          warnings.push(`[ActiveBlocker #${b.local_id || b.id}] ${b.content}`);
+        }
+      }
+
+      return {
+        repository: repoName,
+        symbolName,
+        symbol,
+        dependencyGraph: {
+          symbol: symbolName,
+          repository: repoName,
+          inboundCallers,
+          outboundCallees,
+          blastRadius
+        },
+        context: {
+          symbolInvariants,
+          fileInvariants,
+          generalInvariants: generalInvariants.slice(0, 5),
+          activeBlockers,
+          allAttachedItems: uniqueContext
+        },
+        audit: {
+          blastRadius,
+          requiresCallerAudit,
+          hasBlockers: activeBlockers.length > 0,
+          governingInvariantsCount: symbolInvariants.length + fileInvariants.length,
+          warnings
+        }
+      };
+    },
+
+    /**
+     * Traces the transitive blast radius of a symbol across pgGraph
+     * and joins with all active invariants governing every caller node.
+     */
+    async traceBlastRadiusWithInvariants({ repoName, symbolName, workspaceName = null }) {
+      if (!repoName || !symbolName) {
+        throw new Error('traceBlastRadiusWithInvariants() requires both repoName and symbolName');
+      }
+      const targetWorkspace = workspaceName || repoName;
+
+      const graph = await git.getDependencyGraph(repoName, symbolName);
+      const callers = graph.inboundCallers || [];
+
+      // Collect all unique caller files and symbols
+      const callerNodes = [];
+      const nodeMap = new Map();
+
+      for (const c of callers) {
+        const callerKey = `${c.source_path}:${c.source_symbol}`;
+        if (!nodeMap.has(callerKey)) {
+          const nodeObj = {
+            symbol: c.source_symbol,
+            filePath: c.source_path,
+            depth: c.depth,
+            relation: c.relation,
+            invariants: []
+          };
+          nodeMap.set(callerKey, nodeObj);
+          callerNodes.push(nodeObj);
+        }
+      }
+
+      // For each caller node, fetch attaching invariants from pg_context_items
+      for (const node of callerNodes) {
+        const matching = await context.queryRemoteContext({
+          workspaceName: targetWorkspace,
+          query: node.symbol,
+          category: 'invariant',
+          limit: 5
+        });
+        node.invariants = matching;
+      }
+
+      return {
+        repository: repoName,
+        rootSymbol: symbolName,
+        blastRadius: callerNodes.length,
+        callerNodes,
+        outboundCallees: graph.outboundCallees || []
+      };
+    },
+
+    /**
+     * Executes direct SQL join between pg_git_symbols and pg_context_items
+     * in Polygres / PostgreSQL.
+     */
+    async queryCrossSubstrate({ repoName, workspaceName = null, limit = 50 }) {
+      const pool = getSharedRemotePool() || git._getRemotePool();
+      const targetWorkspace = workspaceName || repoName;
+      const cappedLimit = Math.min(Math.max(1, limit), 200);
+
+      const res = await pool.query(`
+        SELECT 
+          s.symbol_name,
+          s.file_path,
+          s.symbol_type,
+          s.start_line,
+          s.end_line,
+          s.signature,
+          c.local_id as context_id,
+          c.category as context_category,
+          c.content as context_content,
+          c.status as context_status
+        FROM pg_git_symbols s
+        JOIN pg_context_items c ON (
+          c.content ILIKE '%' || s.symbol_name || '%' OR
+          (length(s.file_path) > 3 AND c.content ILIKE '%' || s.file_path || '%')
+        )
+        WHERE s.repository_name = $1 
+          AND (c.source_workspace = $2 OR c.source_workspace = '*' OR c.source_workspace = 'default' OR c.source_workspace = 'homelab')
+          AND c.status = 'active'
+        ORDER BY s.file_path ASC, s.start_line ASC
+        LIMIT $3;
+      `, [repoName, targetWorkspace, cappedLimit]);
+
+      return res.rows;
+    },
+
+    /**
+     * Audits a proposed mutation or refactoring against pgGraph call edges
+     * and KruschContext steering invariants.
+     */
+    async auditSymbolRefactor({ repoName, symbolName, proposedAction = 'modify', workspaceName = null }) {
+      const symContext = await this.getSymbolContext({ repoName, symbolName, workspaceName });
+      const { blastRadius, requiresCallerAudit, warnings } = symContext.audit;
+
+      const allowed = !symContext.audit.hasBlockers;
+      const requiresManualConfirmation = requiresCallerAudit && proposedAction === 'rename';
+
+      return {
+        repoName,
+        symbolName,
+        proposedAction,
+        allowed,
+        requiresManualConfirmation,
+        blastRadius,
+        warnings,
+        inboundCallers: symContext.dependencyGraph.inboundCallers
+      };
+    },
+
     async close() {
       await context.close();
       await git.close();

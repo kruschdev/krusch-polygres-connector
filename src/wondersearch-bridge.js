@@ -1,19 +1,22 @@
 /**
  * Wondersearch Bridge for @krusch/polygres-connector
  * Provides native passage search, drive management, and code chunk indexing
- * against Evokoa / Wondersearch Cloud API with timeout resilience and air-gap guards.
+ * against Wondersearch Cloud API with bounded concurrency, retries, and strict air-gap guards.
  */
 
 import crypto from 'crypto';
-import { assertCloudAllowed } from './config.js';
+import fs from 'fs';
+import path from 'path';
+import { assertCloudAllowed, assertMatterNotPrivileged } from './config.js';
 
 export class WondersearchBridge {
   constructor(config = {}) {
-    this.apiKey = config.wondersearchApiKey || process.env.WONDERSEARCH_API_KEY || process.env.POLYGRES_API_KEY;
+    this.apiKey = config.wondersearchApiKey || process.env.WONDERSEARCH_API_KEY;
     this.baseUrl = (config.wondersearchBaseUrl || process.env.WONDERSEARCH_BASE_URL || 'https://api.wondersearch.ai').replace(/\/+$/, '');
     this.workspaceId = config.wondersearchWorkspaceId || process.env.WONDERSEARCH_WORKSPACE_ID || null;
     this.allowCloud = config.allowCloud;
     this.timeoutMs = config.timeoutMs || 15000;
+    this.concurrency = config.concurrency || 6;
     this.driveCache = new Map();
   }
 
@@ -23,7 +26,7 @@ export class WondersearchBridge {
 
   _headers(idempotencyKey) {
     if (!this.apiKey) {
-      throw new Error('WondersearchBridge requires an API key. Set WONDERSEARCH_API_KEY or POLYGRES_API_KEY.');
+      throw new Error('WondersearchBridge requires an API key. Set WONDERSEARCH_API_KEY in environment.');
     }
     assertCloudAllowed(this.baseUrl, this.allowCloud);
 
@@ -38,6 +41,42 @@ export class WondersearchBridge {
       headers['Idempotency-Key'] = `krusch-${crypto.randomBytes(8).toString('hex')}`;
     }
     return headers;
+  }
+
+  /**
+   * Helper to execute fetch with exponential backoff on transient errors (429, 5xx)
+   */
+  async _fetchWithRetry(url, options, maxRetries = 3) {
+    let attempt = 0;
+    let delay = 300;
+
+    while (true) {
+      try {
+        const res = await fetch(url, {
+          ...options,
+          signal: AbortSignal.timeout(this.timeoutMs)
+        });
+
+        if (res.status === 429 || (res.status >= 500 && res.status <= 504)) {
+          if (attempt < maxRetries) {
+            attempt++;
+            await new Promise(r => setTimeout(r, delay));
+            delay *= 2;
+            continue;
+          }
+        }
+
+        return res;
+      } catch (err) {
+        if (attempt < maxRetries && (err.name === 'TimeoutError' || err.name === 'AbortError')) {
+          attempt++;
+          await new Promise(r => setTimeout(r, delay));
+          delay *= 2;
+          continue;
+        }
+        throw err;
+      }
+    }
   }
 
   /**
@@ -56,16 +95,15 @@ export class WondersearchBridge {
     const payload = {
       query,
       effort,
-      limit,
+      limit: Math.min(Math.max(1, limit), 100),
       group_by_document: groupByDocument
     };
     if (folderId) payload.folder_id = folderId;
 
-    const res = await fetch(url, {
+    const res = await this._fetchWithRetry(url, {
       method: 'POST',
       headers: this._headers(),
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(this.timeoutMs)
+      body: JSON.stringify(payload)
     });
 
     if (!res.ok) {
@@ -94,7 +132,7 @@ export class WondersearchBridge {
   }
 
   /**
-   * Ingest text content into a Wondersearch drive
+   * Ingest text content into a Wondersearch drive with retry and strict air-gap guards
    */
   async ingestDocument({ driveId, externalId, text, metadata = {} }) {
     if (!driveId) throw new Error('ingestDocument() requires driveId');
@@ -117,11 +155,10 @@ export class WondersearchBridge {
       }
     };
 
-    const res = await fetch(url, {
+    const res = await this._fetchWithRetry(url, {
       method: 'POST',
       headers: this._headers(),
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(this.timeoutMs)
+      body: JSON.stringify(payload)
     });
 
     if (!res.ok) {
@@ -133,7 +170,8 @@ export class WondersearchBridge {
   }
 
   /**
-   * Create or resolve a drive by name in the workspace
+   * Create or resolve a drive by name in the workspace.
+   * Handles 409 conflict gracefully if two concurrent processes create the same drive.
    */
   async createOrGetDrive(driveName) {
     if (this.driveCache.has(driveName)) {
@@ -144,10 +182,10 @@ export class WondersearchBridge {
     }
 
     const listUrl = `${this.baseUrl}/v1/workspaces/${this.workspaceId}/drives`;
-    const listRes = await fetch(listUrl, {
-      headers: this._headers(),
-      signal: AbortSignal.timeout(this.timeoutMs)
+    const listRes = await this._fetchWithRetry(listUrl, {
+      headers: this._headers()
     });
+
     if (listRes.ok) {
       const listData = await listRes.json();
       const match = (listData.drives || []).find(d => d.name === driveName);
@@ -157,13 +195,25 @@ export class WondersearchBridge {
       }
     }
 
-    // Create new drive
-    const createRes = await fetch(listUrl, {
+    // Attempt creation
+    const createRes = await this._fetchWithRetry(listUrl, {
       method: 'POST',
       headers: this._headers(),
-      body: JSON.stringify({ name: driveName }),
-      signal: AbortSignal.timeout(this.timeoutMs)
+      body: JSON.stringify({ name: driveName })
     });
+
+    if (createRes.status === 409) {
+      // Conflict: another process created the drive. Re-fetch list.
+      const retryListRes = await this._fetchWithRetry(listUrl, { headers: this._headers() });
+      if (retryListRes.ok) {
+        const retryData = await retryListRes.json();
+        const match = (retryData.drives || []).find(d => d.name === driveName);
+        if (match) {
+          this.driveCache.set(driveName, match.id);
+          return match.id;
+        }
+      }
+    }
 
     if (!createRes.ok) {
       const errText = await createRes.text();
@@ -176,64 +226,81 @@ export class WondersearchBridge {
   }
 
   /**
-   * Synchronize Authority Packs (.yaml) into Wondersearch with classification & path air-gap guards
+   * Helper to execute a pool of worker tasks with bounded concurrency
    */
-  async syncAuthorityPacks(packsDir, driveName = 'repo-krusch-law-statutes') {
-    if (packsDir.includes('krusch-law/data/matters') || packsDir.includes('evidence')) {
-      throw new Error(
-        `[AirGapSecurityError] KruschLaw privileged matter data is 100% air-gapped on-premises. Egress of '${packsDir}' to cloud Wondersearch is blocked by sovereign policy (ABA Model Rule 1.6).`
-      );
+  async _runConcurrent(items, fn) {
+    const results = [];
+    const executing = new Set();
+
+    for (const item of items) {
+      const p = Promise.resolve().then(() => fn(item));
+      results.push(p);
+      executing.add(p);
+      const clean = () => executing.delete(p);
+      p.then(clean, clean);
+
+      if (executing.size >= this.concurrency) {
+        await Promise.race(executing);
+      }
     }
 
-    const fs = await import('fs');
-    const path = await import('path');
-    const driveId = await this.createOrGetDrive(driveName);
+    return Promise.all(results);
+  }
+
+  /**
+   * Synchronize Authority Packs (.yaml) into Wondersearch with realpath matter denial
+   */
+  async syncAuthorityPacks(packsDir, driveName = 'repo-krusch-law-statutes') {
+    assertMatterNotPrivileged(packsDir);
 
     if (!fs.existsSync(packsDir)) {
       throw new Error(`Authority packs directory not found: ${packsDir}`);
     }
 
+    const driveId = await this.createOrGetDrive(driveName);
     const files = fs.readdirSync(packsDir, { recursive: true })
       .filter(f => typeof f === 'string' && (f.endsWith('.yaml') || f.endsWith('.yml') || f.endsWith('.json')));
 
-    let count = 0;
+    const validFiles = [];
     for (const relFile of files) {
       const fullPath = path.join(packsDir, relFile);
+      assertMatterNotPrivileged(fullPath);
       const text = fs.readFileSync(fullPath, 'utf8');
 
-      // Reject privileged files by content signature
       if (/classification:\s*["']?privileged["']?/i.test(text) || /domain:\s*["']?matter["']?/i.test(text)) {
-        throw new Error(`[AirGapSecurityError] File '${relFile}' marked as privileged matter. Cloud egress blocked.`);
+        throw new Error(`[AirGapSecurityError] File '${relFile}' marked as privileged matter. Cloud egress blocked under ABA Model Rule 1.6.`);
       }
+      validFiles.push({ relFile, text });
+    }
 
+    let indexedCount = 0;
+    await this._runConcurrent(validFiles, async ({ relFile, text }) => {
       await this.ingestDocument({
         driveId,
         externalId: `law://${relFile}`,
         text,
         metadata: { domain: 'law', file_path: relFile }
       });
-      count++;
-    }
-    return { driveId, documentsIndexed: count };
+      indexedCount++;
+    });
+
+    return { driveId, documentsIndexed: indexedCount };
   }
 
   /**
    * Synchronize commercial contract playbooks and templates into Wondersearch
    */
   async syncPlaybooks(playbooksDir, driveName = 'repo-krusch-biz-playbooks') {
-    const fs = await import('fs');
-    const path = await import('path');
-    const driveId = await this.createOrGetDrive(driveName);
-
     if (!fs.existsSync(playbooksDir)) {
       throw new Error(`Playbooks directory not found: ${playbooksDir}`);
     }
 
+    const driveId = await this.createOrGetDrive(driveName);
     const files = fs.readdirSync(playbooksDir, { recursive: true })
       .filter(f => typeof f === 'string' && (f.endsWith('.md') || f.endsWith('.txt') || f.endsWith('.json') || f.endsWith('.yaml')));
 
-    let count = 0;
-    for (const relFile of files) {
+    let indexedCount = 0;
+    await this._runConcurrent(files, async (relFile) => {
       const fullPath = path.join(playbooksDir, relFile);
       const text = fs.readFileSync(fullPath, 'utf8');
       await this.ingestDocument({
@@ -242,9 +309,10 @@ export class WondersearchBridge {
         text,
         metadata: { domain: 'biz', file_path: relFile }
       });
-      count++;
-    }
-    return { driveId, documentsIndexed: count };
+      indexedCount++;
+    });
+
+    return { driveId, documentsIndexed: indexedCount };
   }
 
   /**

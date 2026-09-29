@@ -167,7 +167,11 @@ export function loadConfig(overrides = {}) {
     } catch {}
   }
 
-  const polygresUrl = overrides.polygresUrl || process.env.POLYGRES_URL || process.env.DATABASE_URL || null;
+  const localGitDbUrl = overrides.localGitDbUrl || process.env.KRUSCH_GIT_DATABASE_URL || 'postgresql://kdcode:password@localhost:5432/kdcode';
+
+  const polygresUrl = overrides.polygresUrl !== undefined
+    ? overrides.polygresUrl
+    : (process.env.POLYGRES_URL || process.env.DATABASE_URL || process.env.KRUSCH_GIT_DATABASE_URL || localGitDbUrl);
   const polygresApiKey = overrides.polygresApiKey || process.env.POLYGRES_API_KEY || null;
 
   // Separate Wondersearch credentials; do not reuse polygresApiKey by default
@@ -177,7 +181,6 @@ export function loadConfig(overrides = {}) {
   const wondersearchDefaultDriveId = overrides.wondersearchDefaultDriveId || process.env.WONDERSEARCH_DEFAULT_DRIVE_ID || null;
 
   const localContextDbPath = overrides.localContextDbPath || process.env.KRUSCH_CONTEXT_DB_PATH || path.resolve(process.cwd(), '.agent/context.db');
-  const localGitDbUrl = overrides.localGitDbUrl || process.env.KRUSCH_GIT_DATABASE_URL || 'postgresql://kdcode:password@localhost:5432/kdcode';
 
   const allowCloud = overrides.allowCloud !== undefined
     ? Boolean(overrides.allowCloud)

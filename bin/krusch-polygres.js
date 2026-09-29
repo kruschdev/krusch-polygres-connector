@@ -15,6 +15,11 @@ const isJson = flags.has('--json');
 const isDryRun = flags.has('--dry-run');
 const isWriteBack = flags.has('--write');
 
+if (flags.has('--version') || flags.has('-v') || command === 'version') {
+  console.log('@krusch/polygres-connector v0.1.0-preview');
+  process.exit(0);
+}
+
 if (!command || flags.has('--help') || flags.has('-h') || command === 'help') {
   console.log(`
 @krusch/polygres-connector CLI (v0.1.0-preview)
@@ -30,6 +35,11 @@ Core Commands:
   sync-git <repo_name> [commit_sha]      Sync Git DAG, trees, and AST symbols/edges to PostgreSQL
   sync-code <repo_name> [commit_sha]     Index codebase blobs/files to Wondersearch Drive
   find-symbol <repo_name> <symbol>       Authoritative AST symbol declaration lookup
+  symbol-context <repo> <symbol> [ws]    Marry AST symbol, caller CTE, & steering invariants
+  dep-graph <repo_name> <symbol>         Walk recursive caller-callee dependency graph via CTE
+  blast-radius <repo> <symbol> [ws]      Trace transitive caller tree decorated with invariants
+  audit-refactor <repo> <sym> [action]   Audit proposed mutation/rename against caller graph & rules
+  cross-query <repo_name> [workspace]    Relational SQL JOIN between AST symbols and context items
   search-code <repo_name> <query>        Semantic code search via Wondersearch drive
   sync-biz [playbooks_dir]               Sync commercial contract playbooks to Wondersearch
   search-biz <query>                     Search commercial clauses via Wondersearch
@@ -47,11 +57,6 @@ Environment Variables:
   WONDERSEARCH_WORKSPACE_ID              Workspace UUID for Wondersearch drives
   ALLOW_CLOUD=1                          Mandatory flag authorizing remote cloud egress
 `);
-  process.exit(0);
-}
-
-if (flags.has('--version') || flags.has('-v') || command === 'version') {
-  console.log('@krusch/polygres-connector v0.1.0-preview');
   process.exit(0);
 }
 
@@ -172,6 +177,207 @@ async function main() {
           console.log(`   File: ${symbol.file_path}:${symbol.location.lines[0]}-${symbol.location.lines[1]}`);
           if (symbol.signature) console.log(`   Signature: ${symbol.signature}`);
           if (symbol.commit_sha) console.log(`   Commit: ${symbol.commit_sha}`);
+        }
+        break;
+      }
+
+      case 'symbol-context': {
+        const repoName = positionalArgs[1];
+        const symbolName = positionalArgs[2];
+        const workspace = positionalArgs[3] || repoName;
+        if (!repoName || !symbolName) {
+          console.error('Error: specify repo and symbol: krusch-polygres symbol-context <repo_name> <symbol_name> [workspace]');
+          process.exit(1);
+        }
+
+        const symContext = await connector.getSymbolContext({
+          repoName,
+          symbolName,
+          workspaceName: workspace
+        });
+
+        if (isJson) {
+          console.log(JSON.stringify(symContext, null, 2));
+        } else {
+          console.log(`\n=== 🔗 Symbol Context: ${symbolName} (${repoName}) ===\n`);
+          if (symContext.symbol) {
+            const s = symContext.symbol;
+            console.log(`📍 Declaration: ${s.symbol_name} (${s.kind})`);
+            console.log(`   File: ${s.file_path}:${s.location.lines[0]}-${s.location.lines[1]}`);
+            if (s.signature) console.log(`   Signature: ${s.signature}`);
+            if (s.commit_sha) console.log(`   Commit: ${s.commit_sha}`);
+          } else {
+            console.log(`ℹ️  No explicit AST declaration found in pg_git_symbols (external or synthetic).`);
+          }
+
+          console.log(`\n🌳 pgGraph Blast Radius: ${symContext.audit.blastRadius} inbound caller(s)`);
+          if (symContext.dependencyGraph.inboundCallers.length > 0) {
+            console.log('   Inbound Callers:');
+            for (const c of symContext.dependencyGraph.inboundCallers) {
+              console.log(`   • [depth ${c.depth}] ${c.source_symbol} in ${c.source_path} (${c.relation})`);
+            }
+          }
+
+          if (symContext.dependencyGraph.outboundCallees.length > 0) {
+            console.log('   Outbound Callees:');
+            for (const c of symContext.dependencyGraph.outboundCallees) {
+              console.log(`   • [depth ${c.depth}] ${c.source_symbol} calls ${c.target_symbol}`);
+            }
+          }
+
+          console.log(`\n🛡️  KruschContext Steering Invariants (${symContext.context.allAttachedItems.length} attached):`);
+          if (symContext.context.allAttachedItems.length > 0) {
+            for (const item of symContext.context.allAttachedItems) {
+              console.log(`   • [${item.category} #${item.local_id || item.id}] ${item.content.substring(0, 110)}...`);
+            }
+          } else {
+            console.log('   (No specific invariants attached to this symbol/file; standard repo rules apply)');
+          }
+
+          if (symContext.context.activeBlockers.length > 0) {
+            console.log(`\n⚠️  Active Blockers:`);
+            for (const b of symContext.context.activeBlockers) {
+              console.log(`   🚨 [Blocker #${b.local_id || b.id}] ${b.content}`);
+            }
+          }
+
+          console.log(`\n🚦 Refactor Risk Assessment:`);
+          console.log(`   Requires Caller Audit: ${symContext.audit.requiresCallerAudit ? 'YES (Callers present) ⚠️' : 'NO (Leaf node) ✅'}`);
+          for (const w of symContext.audit.warnings) {
+            console.log(`   ⚠️  ${w}`);
+          }
+          console.log();
+        }
+        break;
+      }
+
+      case 'dep-graph': {
+        const repoName = positionalArgs[1];
+        const symbolName = positionalArgs[2];
+        if (!repoName || !symbolName) {
+          console.error('Error: specify repo and symbol: krusch-polygres dep-graph <repo_name> <symbol_name>');
+          process.exit(1);
+        }
+
+        const graph = await connector.git.getDependencyGraph(repoName, symbolName);
+        if (isJson) {
+          console.log(JSON.stringify(graph, null, 2));
+        } else {
+          console.log(`\n=== 🌳 Dependency Graph: ${symbolName} (${repoName}) ===\n`);
+          console.log(`Inbound Callers (${graph.inboundCallers.length}):`);
+          if (graph.inboundCallers.length === 0) {
+            console.log('  (None)');
+          } else {
+            for (const c of graph.inboundCallers) {
+              console.log(`  • [depth ${c.depth}] ${c.source_symbol} in ${c.source_path} (L${c.line_number || 1})`);
+            }
+          }
+          console.log(`\nOutbound Callees (${graph.outboundCallees.length}):`);
+          if (graph.outboundCallees.length === 0) {
+            console.log('  (None)');
+          } else {
+            for (const c of graph.outboundCallees) {
+              console.log(`  • [depth ${c.depth}] calls ${c.target_symbol} (${c.target_path || 'external'})`);
+            }
+          }
+          console.log();
+        }
+        break;
+      }
+
+      case 'blast-radius': {
+        const repoName = positionalArgs[1];
+        const symbolName = positionalArgs[2];
+        const workspace = positionalArgs[3] || repoName;
+        if (!repoName || !symbolName) {
+          console.error('Error: specify repo and symbol: krusch-polygres blast-radius <repo_name> <symbol_name> [workspace]');
+          process.exit(1);
+        }
+
+        const blast = await connector.traceBlastRadiusWithInvariants({
+          repoName,
+          symbolName,
+          workspaceName: workspace
+        });
+
+        if (isJson) {
+          console.log(JSON.stringify(blast, null, 2));
+        } else {
+          console.log(`\n=== 💥 Transitive Blast Radius: ${symbolName} (${repoName}) ===`);
+          console.log(`Total Upstream Affected Nodes: ${blast.blastRadius}\n`);
+          for (const node of blast.callerNodes) {
+            console.log(`📍 Node: ${node.symbol} (in ${node.filePath}, depth: ${node.depth})`);
+            if (node.invariants.length > 0) {
+              for (const inv of node.invariants) {
+                console.log(`   🛡️  [${inv.category} #${inv.local_id || inv.id}] ${inv.content.substring(0, 90)}...`);
+              }
+            } else {
+              console.log(`   (No specific invariants attached)`);
+            }
+          }
+          console.log();
+        }
+        break;
+      }
+
+      case 'audit-refactor': {
+        const repoName = positionalArgs[1];
+        const symbolName = positionalArgs[2];
+        const action = positionalArgs[3] || 'modify';
+        const workspace = positionalArgs[4] || repoName;
+        if (!repoName || !symbolName) {
+          console.error('Error: specify repo and symbol: krusch-polygres audit-refactor <repo_name> <symbol_name> [action] [workspace]');
+          process.exit(1);
+        }
+
+        const audit = await connector.auditSymbolRefactor({
+          repoName,
+          symbolName,
+          proposedAction: action,
+          workspaceName: workspace
+        });
+
+        if (isJson) {
+          console.log(JSON.stringify(audit, null, 2));
+        } else {
+          console.log(`\n=== 🚦 Refactor Safety Gate: ${symbolName} (${action}) ===`);
+          console.log(`Status: ${audit.allowed ? 'ALLOWED ✅' : 'BLOCKED ❌'}`);
+          console.log(`Manual Confirmation Required: ${audit.requiresManualConfirmation ? 'YES (Renaming symbol with callers) ⚠️' : 'NO ✅'}`);
+          console.log(`Blast Radius: ${audit.blastRadius} caller(s)`);
+          if (audit.warnings.length > 0) {
+            console.log('\nWarnings:');
+            for (const w of audit.warnings) {
+              console.log(`• ${w}`);
+            }
+          }
+          console.log();
+        }
+        break;
+      }
+
+      case 'cross-query': {
+        const repoName = positionalArgs[1];
+        const workspace = positionalArgs[2] || repoName;
+        if (!repoName) {
+          console.error('Error: specify repo name: krusch-polygres cross-query <repo_name> [workspace]');
+          process.exit(1);
+        }
+
+        const rows = await connector.queryCrossSubstrate({
+          repoName,
+          workspaceName: workspace,
+          limit: 30
+        });
+
+        if (isJson) {
+          console.log(JSON.stringify(rows, null, 2));
+        } else {
+          console.log(`\n=== 🔗 Cross-Substrate Relational Join: ${repoName} ⨝ ${workspace} ===`);
+          console.log(`Found ${rows.length} matched symbol/context pairs:\n`);
+          for (const r of rows) {
+            console.log(`📍 ${r.symbol_name} (${r.symbol_type}) in ${r.file_path}:L${r.start_line}`);
+            console.log(`   ↳ [${r.context_category} #${r.context_id}] ${r.context_content.substring(0, 100)}...\n`);
+          }
         }
         break;
       }

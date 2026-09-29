@@ -16,8 +16,12 @@ const __dirname = path.dirname(__filename);
 
 export class GitBridge {
   constructor(config = {}) {
-    this.localDbUrl = config.localGitDbUrl || process.env.KRUSCH_GIT_DATABASE_URL;
-    this.polygresUrl = config.polygresUrl || process.env.POLYGRES_URL || process.env.DATABASE_URL;
+    this.localDbUrl = config.localGitDbUrl !== undefined
+      ? config.localGitDbUrl
+      : (process.env.KRUSCH_GIT_DATABASE_URL || null);
+    this.polygresUrl = config.polygresUrl !== undefined
+      ? config.polygresUrl
+      : (process.env.POLYGRES_URL || process.env.DATABASE_URL || null);
     this.allowCloud = config.allowCloud;
 
     this.localPool = null;   // Lazy-initialized

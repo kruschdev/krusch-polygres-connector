@@ -89,7 +89,9 @@ export function sanitizeMemoryRecord(record, options = {}) {
 export class ContextBridge {
   constructor(config = {}) {
     this.contextDbPath = config.localContextDbPath;
-    this.polygresUrl = config.polygresUrl || process.env.POLYGRES_URL || process.env.DATABASE_URL;
+    this.polygresUrl = config.polygresUrl !== undefined
+      ? config.polygresUrl
+      : (process.env.POLYGRES_URL || process.env.DATABASE_URL || null);
     this.allowCloud = config.allowCloud;
     this.sharedPool = config.sharedRemotePool || null;
     this.pool = this.sharedPool;

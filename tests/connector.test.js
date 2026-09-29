@@ -26,7 +26,7 @@ test('WondersearchBridge validates API key requirement', async () => {
 });
 
 test('WondersearchBridge generates correct headers with idempotency key', () => {
-  const bridge = new WondersearchBridge({ wondersearchApiKey: 'test_token_abc' });
+  const bridge = new WondersearchBridge({ wondersearchApiKey: 'test_token_abc', allowCloud: true });
   const headers = bridge._headers('custom-key-1');
   assert.strictEqual(headers['Authorization'], 'Bearer test_token_abc');
   assert.strictEqual(headers['Idempotency-Key'], 'custom-key-1');

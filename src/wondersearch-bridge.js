@@ -1,16 +1,19 @@
 /**
  * Wondersearch Bridge for @krusch/polygres-connector
  * Provides native passage search, drive management, and code chunk indexing
- * against Evokoa / Wondersearch Cloud API.
+ * against Evokoa / Wondersearch Cloud API with timeout resilience and air-gap guards.
  */
 
 import crypto from 'crypto';
+import { assertCloudAllowed } from './config.js';
 
 export class WondersearchBridge {
   constructor(config = {}) {
     this.apiKey = config.wondersearchApiKey || process.env.WONDERSEARCH_API_KEY || process.env.POLYGRES_API_KEY;
     this.baseUrl = (config.wondersearchBaseUrl || process.env.WONDERSEARCH_BASE_URL || 'https://api.wondersearch.ai').replace(/\/+$/, '');
     this.workspaceId = config.wondersearchWorkspaceId || process.env.WONDERSEARCH_WORKSPACE_ID || null;
+    this.allowCloud = config.allowCloud;
+    this.timeoutMs = config.timeoutMs || 15000;
     this.driveCache = new Map();
   }
 
@@ -18,6 +21,8 @@ export class WondersearchBridge {
     if (!this.apiKey) {
       throw new Error('WondersearchBridge requires an API key. Set WONDERSEARCH_API_KEY or POLYGRES_API_KEY.');
     }
+    assertCloudAllowed(this.baseUrl, this.allowCloud);
+
     const headers = {
       'Authorization': `Bearer ${this.apiKey}`,
       'Content-Type': 'application/json',
@@ -55,7 +60,8 @@ export class WondersearchBridge {
     const res = await fetch(url, {
       method: 'POST',
       headers: this._headers(),
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(this.timeoutMs)
     });
 
     if (!res.ok) {
@@ -103,7 +109,8 @@ export class WondersearchBridge {
     const res = await fetch(url, {
       method: 'POST',
       headers: this._headers(),
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(this.timeoutMs)
     });
 
     if (!res.ok) {
@@ -126,7 +133,10 @@ export class WondersearchBridge {
     }
 
     const listUrl = `${this.baseUrl}/v1/workspaces/${this.workspaceId}/drives`;
-    const listRes = await fetch(listUrl, { headers: this._headers() });
+    const listRes = await fetch(listUrl, {
+      headers: this._headers(),
+      signal: AbortSignal.timeout(this.timeoutMs)
+    });
     if (listRes.ok) {
       const listData = await listRes.json();
       const match = (listData.drives || []).find(d => d.name === driveName);
@@ -140,7 +150,8 @@ export class WondersearchBridge {
     const createRes = await fetch(listUrl, {
       method: 'POST',
       headers: this._headers(),
-      body: JSON.stringify({ name: driveName })
+      body: JSON.stringify({ name: driveName }),
+      signal: AbortSignal.timeout(this.timeoutMs)
     });
 
     if (!createRes.ok) {
@@ -154,9 +165,16 @@ export class WondersearchBridge {
   }
 
   /**
-   * Synchronize Authority Packs (.yaml) or legal statute files into Wondersearch
+   * Synchronize Authority Packs (.yaml) into Wondersearch with fail-closed KruschLaw air-gap guard
    */
   async syncAuthorityPacks(packsDir, driveName = 'repo-krusch-law-statutes') {
+    // Air-gap guard: KruschLaw matter stores must never egress to cloud
+    if (packsDir.includes('krusch-law/data/matters') || packsDir.includes('evidence')) {
+      throw new Error(
+        `[AirGapSecurityError] KruschLaw privileged matter data is 100% air-gapped on-premises. Egress of '${packsDir}' to cloud Wondersearch is blocked by sovereign policy (ABA Model Rule 1.6).`
+      );
+    }
+
     const fs = await import('fs');
     const path = await import('path');
     const driveId = await this.createOrGetDrive(driveName);
@@ -214,7 +232,7 @@ export class WondersearchBridge {
   }
 
   /**
-   * Search statutes across the KruschLaw Wondersearch drive
+   * Search statutes across public Authority Packs on Wondersearch
    */
   async searchLaw(query, options = {}) {
     const driveId = await this.createOrGetDrive(options.driveName || 'repo-krusch-law-statutes');

@@ -155,31 +155,35 @@ export class WondersearchBridge {
   }
 
   /**
-   * Ingest text content into a Wondersearch drive with retry and strict air-gap guards
+   * Ingest a batch of text documents into a Wondersearch drive with retry and strict air-gap guards
    */
-  async ingestDocument({ driveId, externalId, text, metadata = {} }) {
-    if (!driveId) throw new Error('ingestDocument() requires driveId');
+  async ingestDocuments({ driveId, documents = [] }) {
+    if (!driveId) throw new Error('ingestDocuments() requires driveId');
+    if (!Array.isArray(documents) || documents.length === 0) {
+      return { documents: [] };
+    }
 
     // Classification air-gap guard: strictly reject privileged litigation matters
-    if (metadata.classification === 'privileged' || metadata.domain === 'matter') {
-      throw new Error(
-        `[AirGapSecurityError] Document '${externalId}' marked as privileged litigation matter. Cloud egress blocked under ABA Model Rule 1.6.`
-      );
+    for (const doc of documents) {
+      const meta = doc.metadata || {};
+      if (meta.classification === 'privileged' || meta.domain === 'matter') {
+        throw new Error(
+          `[AirGapSecurityError] Document '${doc.externalId || doc.external_id}' marked as privileged litigation matter. Cloud egress blocked under ABA Model Rule 1.6.`
+        );
+      }
     }
 
     const url = `${this.baseUrl}/v1/drives/${driveId}/documents`;
     const payload = {
-      documents: [
-        {
-          external_id: externalId,
-          text,
-          metadata: {
-            ...metadata,
-            indexed_by: '@krusch/polygres-connector',
-            indexed_at: new Date().toISOString()
-          }
+      documents: documents.map(doc => ({
+        external_id: doc.externalId || doc.external_id,
+        text: doc.text,
+        metadata: {
+          ...(doc.metadata || {}),
+          indexed_by: '@krusch/polygres-connector',
+          indexed_at: new Date().toISOString()
         }
-      ]
+      }))
     };
 
     const res = await this._fetchWithRetry(url, {
@@ -194,6 +198,16 @@ export class WondersearchBridge {
     }
 
     return res.json();
+  }
+
+  /**
+   * Ingest text content into a Wondersearch drive with retry and strict air-gap guards
+   */
+  async ingestDocument({ driveId, externalId, text, metadata = {} }) {
+    return this.ingestDocuments({
+      driveId,
+      documents: [{ externalId, text, metadata }]
+    });
   }
 
   /**

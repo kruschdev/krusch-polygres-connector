@@ -28,6 +28,7 @@ Core Commands:
   sync-context [workspace]               Push local working memory (.agent/context.db) to PostgreSQL
   pull-context [workspace]               Pull active invariants & decisions from remote PostgreSQL
   sync-git <repo_name> [commit_sha]      Sync Git DAG, trees, and AST symbols/edges to PostgreSQL
+  sync-code <repo_name> [commit_sha]     Index codebase blobs/files to Wondersearch Drive
   find-symbol <repo_name> <symbol>       Authoritative AST symbol declaration lookup
   search-code <repo_name> <query>        Semantic code search via Wondersearch drive
   sync-biz [playbooks_dir]               Sync commercial contract playbooks to Wondersearch
@@ -175,6 +176,25 @@ async function main() {
         break;
       }
 
+      case 'sync-code': {
+        const repoName = positionalArgs[1];
+        const sha = positionalArgs[2] || null;
+        if (!repoName) {
+          console.error('Error: specify a repository name: krusch-polygres sync-code <repo_name> [commit_sha]');
+          process.exit(1);
+        }
+        if (!isJson) {
+          console.log(`Syncing codebase blobs to Wondersearch drive for '${repoName}'...`);
+        }
+        const wsRes = await connector.git.syncCodebaseToWondersearch(repoName, null, sha);
+        if (isJson) {
+          console.log(JSON.stringify(wsRes, null, 2));
+        } else {
+          console.log(`✅ Indexed ${wsRes.documentsIndexed} code documents into Wondersearch drive '${wsRes.driveId}'.`);
+        }
+        break;
+      }
+
       case 'search-code': {
         const repoName = positionalArgs[1];
         const query = positionalArgs.slice(2).join(' ');
@@ -239,6 +259,7 @@ async function main() {
     process.exit(1);
   } finally {
     await connector.close();
+    process.exit(0);
   }
 }
 

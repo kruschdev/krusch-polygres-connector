@@ -176,7 +176,7 @@ export function loadConfig(overrides = {}) {
   const wondersearchWorkspaceId = overrides.wondersearchWorkspaceId || process.env.WONDERSEARCH_WORKSPACE_ID || null;
 
   const localContextDbPath = overrides.localContextDbPath || process.env.KRUSCH_CONTEXT_DB_PATH || path.resolve(process.cwd(), '.agent/context.db');
-  const localGitDbUrl = overrides.localGitDbUrl || process.env.KRUSCH_GIT_DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/kruschdb';
+  const localGitDbUrl = overrides.localGitDbUrl || process.env.KRUSCH_GIT_DATABASE_URL || 'postgresql://kdcode:password@localhost:5432/kdcode';
 
   const allowCloud = overrides.allowCloud !== undefined
     ? Boolean(overrides.allowCloud)

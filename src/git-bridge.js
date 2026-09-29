@@ -488,17 +488,33 @@ export class GitBridge {
       WHERE r.name = $1 AND b.file_path IS NOT NULL
     `, [repoName]);
 
-    let indexedCount = 0;
+    const candidateRoots = [
+      path.resolve('/home/krusch/homelab/projects', repoName),
+      path.resolve('/home/krusch/homelab', repoName),
+      process.cwd()
+    ];
+
+    const documentsToIngest = [];
     for (const b of blobsRes.rows) {
       let text = '';
       if (b.content) {
         text = Buffer.isBuffer(b.content) ? b.content.toString('utf8') : String(b.content);
       }
+      if (!text) {
+        for (const root of candidateRoots) {
+          const diskPath = path.join(root, b.file_path);
+          if (fs.existsSync(diskPath)) {
+            try {
+              text = fs.readFileSync(diskPath, 'utf8');
+              break;
+            } catch {}
+          }
+        }
+      }
       if (!text && b.summary) text = b.summary;
       if (!text) continue;
 
-      await this.wondersearch.ingestDocument({
-        driveId,
+      documentsToIngest.push({
         externalId: b.file_path,
         text,
         metadata: {
@@ -508,7 +524,17 @@ export class GitBridge {
           commit_sha: activeSha
         }
       });
-      indexedCount++;
+    }
+
+    const BATCH_SIZE = 10;
+    let indexedCount = 0;
+    for (let i = 0; i < documentsToIngest.length; i += BATCH_SIZE) {
+      const batch = documentsToIngest.slice(i, i + BATCH_SIZE);
+      await this.wondersearch.ingestDocuments({
+        driveId,
+        documents: batch
+      });
+      indexedCount += batch.length;
     }
 
     return {

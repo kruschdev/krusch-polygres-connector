@@ -5,15 +5,69 @@
 import path from 'path';
 
 /**
+ * Robust check if a target host/URL is local, private RFC1918, Docker/K8s, or IPv6 ULA.
+ */
+export function isPrivateOrLocalHost(target) {
+  if (!target) return true;
+  let hostname = target;
+
+  try {
+    if (target.includes('://')) {
+      const parsed = new URL(target);
+      hostname = parsed.hostname;
+    } else {
+      hostname = target.split(':')[0];
+    }
+  } catch {
+    hostname = target;
+  }
+
+  // Strip brackets from IPv6 if present
+  hostname = hostname.replace(/^\[|\]$/g, '').toLowerCase();
+
+  // 1. Loopback
+  if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1') {
+    return true;
+  }
+
+  // 2. RFC1918: 10.0.0.0/8
+  if (/^10\.\d+\.\d+\.\d+$/.test(hostname)) {
+    return true;
+  }
+
+  // 3. RFC1918: 172.16.0.0/12 (Docker, Kubernetes, WSL)
+  const match172 = hostname.match(/^172\.(\d+)\.\d+\.\d+$/);
+  if (match172) {
+    const secondOctet = parseInt(match172[1], 10);
+    if (secondOctet >= 16 && secondOctet <= 31) return true;
+  }
+
+  // 4. RFC1918: 192.168.0.0/16
+  if (/^192\.168\.\d+\.\d+$/.test(hostname)) {
+    return true;
+  }
+
+  // 5. Link-Local: 169.254.0.0/16
+  if (/^169\.254\.\d+\.\d+$/.test(hostname)) {
+    return true;
+  }
+
+  // 6. IPv6 ULA / Link-Local: fc00::/7, fd00::/8, fe80::/10
+  if (/^(?:fc|fd|fe80)/i.test(hostname)) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
  * Validates that cloud egress is explicitly authorized when connecting to non-local endpoints.
  */
 export function assertCloudAllowed(target, allowCloud) {
   if (allowCloud) return true;
   if (!target) return true;
 
-  // Local/private targets are always permitted without cloud egress flag
-  const isLocal = /localhost|127\.0\.0\.1|::1|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+/i.test(target);
-  if (!isLocal) {
+  if (!isPrivateOrLocalHost(target)) {
     throw new Error(
       `[AirGapSecurityError] Cloud egress to '${target}' blocked. Set ALLOW_CLOUD=1 in your environment to authorize remote communication with Polygres Cloud / Wondersearch.`
     );

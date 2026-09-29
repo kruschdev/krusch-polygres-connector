@@ -1,6 +1,6 @@
 /**
  * Context Bridge for @krusch/polygres-connector
- * Connects krusch-context-mcp working memory (.agent/context.db) with Polygres Cloud pgContext.
+ * Connects krusch-context-mcp working memory (.agent/context.db) with Polygres Cloud.
  */
 
 import fs from 'fs';
@@ -9,12 +9,15 @@ import { DatabaseSync } from 'node:sqlite';
 import { assertCloudAllowed } from './config.js';
 
 export const SENSITIVE_PATTERNS = [
-  /sk-[a-zA-Z0-9_-]{20,}/i,               // OpenAI / OpenRouter / Anthropic keys
-  /cfut_[a-zA-Z0-9_-]{20,}/i,             // Cloudflare tokens
-  /ghp_[a-zA-Z0-9]{20,}/i,                // GitHub personal access tokens
-  /glpat-[a-zA-Z0-9_-]{20,}/i,            // GitLab tokens
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----/i,  // Cryptographic private keys
-  /(?:password|passwd|secret)\s*[:=]\s*['"][^'"]{8,}['"]/i // Plaintext hardcoded passwords
+  /sk-[a-zA-Z0-9_-]{20,}/i,                                      // OpenAI / OpenRouter / Anthropic keys
+  /cfut_[a-zA-Z0-9_-]{20,}/i,                                    // Cloudflare tokens
+  /ghp_[a-zA-Z0-9]{20,}/i,                                       // GitHub personal access tokens
+  /glpat-[a-zA-Z0-9_-]{20,}/i,                                   // GitLab tokens
+  /AKIA[0-9A-Z]{16}/,                                            // AWS Access Key ID
+  /xox[baprs]-[0-9a-zA-Z]{10,}/,                                 // Slack API tokens
+  /eyJ[a-zA-Z0-9_-]{10,}\.eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}/, // Generic JWT tokens
+  /-----BEGIN [A-Z ]*(?:PRIVATE KEY|KEY BLOCK)-----/i,           // Cryptographic private keys
+  /(?:password|passwd|secret)\s*[:=]\s*['"][^'"]{8,}['"]/i       // Plaintext hardcoded passwords
 ];
 
 /**
@@ -37,12 +40,24 @@ export class ContextBridge {
     this.contextDbPath = config.localContextDbPath;
     this.polygresUrl = config.polygresUrl || process.env.POLYGRES_URL || process.env.DATABASE_URL;
     this.allowCloud = config.allowCloud;
-    this.pool = this.polygresUrl ? new pg.Pool({ connectionString: this.polygresUrl }) : null;
+    this.pool = null; // Lazy-initialized
+  }
+
+  _getPool() {
+    if (!this.pool) {
+      if (!this.polygresUrl) {
+        throw new Error('ContextBridge requires polygresUrl to connect to remote database.');
+      }
+      assertCloudAllowed(this.polygresUrl, this.allowCloud);
+      this.pool = new pg.Pool({ connectionString: this.polygresUrl });
+    }
+    return this.pool;
   }
 
   async close() {
     if (this.pool) {
       await this.pool.end();
+      this.pool = null;
     }
   }
 
@@ -50,10 +65,9 @@ export class ContextBridge {
    * Initialize remote table in Polygres Cloud
    */
   async initializeRemoteSchema() {
-    if (!this.pool) throw new Error('ContextBridge requires polygresUrl to connect.');
-    assertCloudAllowed(this.polygresUrl, this.allowCloud);
+    const pool = this._getPool();
 
-    await this.pool.query(`
+    await pool.query(`
       CREATE TABLE IF NOT EXISTS pg_context_items (
         id SERIAL PRIMARY KEY,
         local_id INTEGER,
@@ -87,7 +101,6 @@ export class ContextBridge {
 
     try {
       const db = new DatabaseSync(this.contextDbPath);
-      // Query items from context_items table
       const stmt = db.prepare(`
         SELECT id, category, content, status, parent_id, superseded_by, created_at, metadata
         FROM context_items
@@ -103,27 +116,46 @@ export class ContextBridge {
   }
 
   /**
-   * Push local working memory entries to Polygres Cloud with pre-sync sanitization
+   * Push local working memory entries to Polygres Cloud with pre-sync sanitization and transactional safety
    */
-  async pushLocalContext(workspaceName = 'homelab') {
-    if (!this.pool) throw new Error('ContextBridge requires polygresUrl to push.');
-    assertCloudAllowed(this.polygresUrl, this.allowCloud);
+  async pushLocalContext(workspaceName = 'homelab', options = {}) {
+    const pool = this._getPool();
     await this.initializeRemoteSchema();
 
     const localEntries = this.readLocalEntries();
     if (localEntries.length === 0) {
-      return { pushed: 0, total: 0 };
+      return { pushed: 0, skipped: 0, total: 0 };
     }
 
-    // Step 1: Pre-sync sanitization audit
+    // Pre-sync sanitization filter
+    const validEntries = [];
+    let skippedCount = 0;
+
     for (const entry of localEntries) {
-      sanitizeMemoryRecord(entry);
+      try {
+        sanitizeMemoryRecord(entry);
+        validEntries.push(entry);
+      } catch (err) {
+        if (options.skipInvalid) {
+          console.warn(`[ContextBridge] Skipping dirty record #${entry.id}: ${err.message}`);
+          skippedCount++;
+        } else {
+          throw err;
+        }
+      }
     }
 
-    // Step 2: Push sanitized records
+    if (validEntries.length === 0) {
+      return { pushed: 0, skipped: skippedCount, total: localEntries.length };
+    }
+
+    // Execute within a single ACID transaction
+    const client = await pool.connect();
     let pushedCount = 0;
-    for (const entry of localEntries) {
-      const meta = typeof entry.metadata === 'string' ? entry.metadata : JSON.stringify(entry.metadata || {});
+
+    try {
+      await client.query('BEGIN');
+
       const query = `
         INSERT INTO pg_context_items (
           local_id, category, content, status, parent_id, superseded_by, source_workspace, metadata
@@ -139,31 +171,41 @@ export class ContextBridge {
           version = pg_context_items.version + 1,
           updated_at = CURRENT_TIMESTAMP;
       `;
-      await this.pool.query(query, [
-        entry.id,
-        entry.category,
-        entry.content,
-        entry.status || 'active',
-        entry.parent_id || null,
-        entry.superseded_by || null,
-        workspaceName,
-        meta
-      ]);
-      pushedCount++;
+
+      for (const entry of validEntries) {
+        const meta = typeof entry.metadata === 'string' ? entry.metadata : JSON.stringify(entry.metadata || {});
+        await client.query(query, [
+          entry.id,
+          entry.category,
+          entry.content,
+          entry.status || 'active',
+          entry.parent_id || null,
+          entry.superseded_by || null,
+          workspaceName,
+          meta
+        ]);
+        pushedCount++;
+      }
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
     }
 
-    return { pushed: pushedCount, total: localEntries.length };
+    return { pushed: pushedCount, skipped: skippedCount, total: localEntries.length };
   }
 
   /**
    * Pull active invariants & decisions from Polygres Cloud for remote agent hydration
    */
   async pullRemoteContext(workspaceName = 'homelab') {
-    if (!this.pool) throw new Error('ContextBridge requires polygresUrl to pull.');
-    assertCloudAllowed(this.polygresUrl, this.allowCloud);
+    const pool = this._getPool();
     await this.initializeRemoteSchema();
 
-    const res = await this.pool.query(`
+    const res = await pool.query(`
       SELECT local_id, category, content, status, parent_id, superseded_by, created_at, metadata
       FROM pg_context_items
       WHERE source_workspace = $1 AND status = 'active'
@@ -185,12 +227,11 @@ export class ContextBridge {
    * Retire or supersede a rule in Polygres Cloud with mandatory lineage justification
    */
   async retireRule(workspaceName = 'homelab', localId, supersededBy = null, justification = '') {
-    if (!this.pool) throw new Error('ContextBridge requires polygresUrl to retire rules.');
-    assertCloudAllowed(this.polygresUrl, this.allowCloud);
+    const pool = this._getPool();
     await this.initializeRemoteSchema();
 
     const status = supersededBy ? 'superseded' : 'invalidated';
-    await this.pool.query(`
+    await pool.query(`
       UPDATE pg_context_items
       SET status = $1, superseded_by = $2, justification = $3, updated_at = CURRENT_TIMESTAMP
       WHERE source_workspace = $4 AND local_id = $5;

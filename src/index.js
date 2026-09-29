@@ -31,6 +31,7 @@ export function createPolygresConnector(options = {}) {
     async close() {
       await context.close();
       await git.close();
+      await wondersearch.close();
     }
   };
 }

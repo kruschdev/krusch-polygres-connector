@@ -17,6 +17,10 @@ export class WondersearchBridge {
     this.driveCache = new Map();
   }
 
+  async close() {
+    this.driveCache.clear();
+  }
+
   _headers(idempotencyKey) {
     if (!this.apiKey) {
       throw new Error('WondersearchBridge requires an API key. Set WONDERSEARCH_API_KEY or POLYGRES_API_KEY.');
@@ -95,6 +99,13 @@ export class WondersearchBridge {
   async ingestDocument({ driveId, externalId, text, metadata = {} }) {
     if (!driveId) throw new Error('ingestDocument() requires driveId');
 
+    // Classification air-gap guard: strictly reject privileged litigation matters
+    if (metadata.classification === 'privileged' || metadata.domain === 'matter') {
+      throw new Error(
+        `[AirGapSecurityError] Document '${externalId}' marked as privileged litigation matter. Cloud egress blocked under ABA Model Rule 1.6.`
+      );
+    }
+
     const url = `${this.baseUrl}/v1/drives/${driveId}/documents`;
     const payload = {
       external_id: externalId,
@@ -165,10 +176,9 @@ export class WondersearchBridge {
   }
 
   /**
-   * Synchronize Authority Packs (.yaml) into Wondersearch with fail-closed KruschLaw air-gap guard
+   * Synchronize Authority Packs (.yaml) into Wondersearch with classification & path air-gap guards
    */
   async syncAuthorityPacks(packsDir, driveName = 'repo-krusch-law-statutes') {
-    // Air-gap guard: KruschLaw matter stores must never egress to cloud
     if (packsDir.includes('krusch-law/data/matters') || packsDir.includes('evidence')) {
       throw new Error(
         `[AirGapSecurityError] KruschLaw privileged matter data is 100% air-gapped on-premises. Egress of '${packsDir}' to cloud Wondersearch is blocked by sovereign policy (ABA Model Rule 1.6).`
@@ -190,6 +200,12 @@ export class WondersearchBridge {
     for (const relFile of files) {
       const fullPath = path.join(packsDir, relFile);
       const text = fs.readFileSync(fullPath, 'utf8');
+
+      // Reject privileged files by content signature
+      if (/classification:\s*["']?privileged["']?/i.test(text) || /domain:\s*["']?matter["']?/i.test(text)) {
+        throw new Error(`[AirGapSecurityError] File '${relFile}' marked as privileged matter. Cloud egress blocked.`);
+      }
+
       await this.ingestDocument({
         driveId,
         externalId: `law://${relFile}`,

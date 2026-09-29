@@ -14,25 +14,51 @@ export class GitBridge {
     this.polygresUrl = config.polygresUrl || process.env.POLYGRES_URL || process.env.DATABASE_URL;
     this.allowCloud = config.allowCloud;
 
-    this.localPool = this.localDbUrl ? new pg.Pool({ connectionString: this.localDbUrl }) : null;
-    this.remotePool = this.polygresUrl ? new pg.Pool({ connectionString: this.polygresUrl }) : null;
+    this.localPool = null;   // Lazy-initialized
+    this.remotePool = null;  // Lazy-initialized
 
     this.wondersearch = new WondersearchBridge(config);
   }
 
+  _getLocalPool() {
+    if (!this.localPool) {
+      if (!this.localDbUrl) {
+        throw new Error('GitBridge requires localGitDbUrl to access local repository database.');
+      }
+      this.localPool = new pg.Pool({ connectionString: this.localDbUrl });
+    }
+    return this.localPool;
+  }
+
+  _getRemotePool() {
+    if (!this.remotePool) {
+      if (!this.polygresUrl) {
+        throw new Error('GitBridge requires polygresUrl to access remote database.');
+      }
+      assertCloudAllowed(this.polygresUrl, this.allowCloud);
+      this.remotePool = new pg.Pool({ connectionString: this.polygresUrl });
+    }
+    return this.remotePool;
+  }
+
   async close() {
-    if (this.localPool) await this.localPool.end();
-    if (this.remotePool) await this.remotePool.end();
+    if (this.localPool) {
+      await this.localPool.end();
+      this.localPool = null;
+    }
+    if (this.remotePool) {
+      await this.remotePool.end();
+      this.remotePool = null;
+    }
   }
 
   /**
    * Initialize remote schema in Polygres Cloud for Git DAG & AST symbols
    */
   async initializeRemoteSchema() {
-    if (!this.remotePool) throw new Error('GitBridge requires polygresUrl.');
-    assertCloudAllowed(this.polygresUrl, this.allowCloud);
+    const remotePool = this._getRemotePool();
 
-    await this.remotePool.query(`
+    await remotePool.query(`
       CREATE TABLE IF NOT EXISTS pg_git_repositories (
         id SERIAL PRIMARY KEY,
         name VARCHAR(255) UNIQUE NOT NULL,
@@ -86,31 +112,25 @@ export class GitBridge {
   }
 
   /**
-   * Push Git DAG (commits, tree) and AST Symbols from local krusch-git to Polygres Cloud with SHA pinning
+   * Push Git DAG (commits, tree) and AST Symbols from local krusch-git to Polygres Cloud with atomic transaction
    */
   async pushGitDagAndSymbols(repoName, commitSha = null) {
-    if (!this.localPool || !this.remotePool) {
+    if (!this.localDbUrl || !this.polygresUrl) {
       throw new Error('pushGitDagAndSymbols() requires both localGitDbUrl and polygresUrl.');
     }
-    assertCloudAllowed(this.polygresUrl, this.allowCloud);
+    const localPool = this._getLocalPool();
+    const remotePool = this._getRemotePool();
     await this.initializeRemoteSchema();
 
-    // 1. Fetch repository
-    const repoRes = await this.localPool.query('SELECT id, name, description FROM repositories WHERE name = $1', [repoName]);
+    // 1. Fetch repository from local
+    const repoRes = await localPool.query('SELECT id, name, description FROM repositories WHERE name = $1', [repoName]);
     if (repoRes.rows.length === 0) {
       throw new Error(`Repository '${repoName}' not found in local krusch-git database.`);
     }
     const localRepoId = repoRes.rows[0].id;
 
-    // Upsert repository in Polygres
-    await this.remotePool.query(`
-      INSERT INTO pg_git_repositories (name, description)
-      VALUES ($1, $2)
-      ON CONFLICT (name) DO UPDATE SET description = EXCLUDED.description;
-    `, [repoName, repoRes.rows[0].description]);
-
-    // 2. Fetch and push commits (The Git DAG)
-    const commitsRes = await this.localPool.query(`
+    // 2. Fetch commits (The Git DAG)
+    const commitsRes = await localPool.query(`
       SELECT id, tree_id, parent_id, message, author, created_at
       FROM commits WHERE repository_id = $1
       ORDER BY created_at ASC
@@ -118,34 +138,73 @@ export class GitBridge {
 
     const activeSha = commitSha || (commitsRes.rows.length > 0 ? commitsRes.rows[commitsRes.rows.length - 1].id : 'HEAD');
 
-    for (const c of commitsRes.rows) {
-      await this.remotePool.query(`
-        INSERT INTO pg_git_commits (id, repository_name, tree_id, parent_id, message, author, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        ON CONFLICT (id) DO NOTHING;
-      `, [c.id, repoName, c.tree_id, c.parent_id, c.message, c.author, c.created_at]);
-    }
-
-    // 3. Fetch and push AST symbols with SHA pinning
-    const symbolsRes = await this.localPool.query(`
+    // 3. Fetch symbols
+    const symbolsRes = await localPool.query(`
       SELECT file_path, symbol_name, symbol_type, start_line, end_line, signature, content
       FROM code_symbols WHERE repository_id = $1
     `, [localRepoId]);
 
-    await this.remotePool.query('DELETE FROM pg_git_symbols WHERE repository_name = $1', [repoName]);
-    for (const s of symbolsRes.rows) {
-      await this.remotePool.query(`
-        INSERT INTO pg_git_symbols (
-          repository_name, commit_sha, file_path, symbol_name, symbol_type, start_line, end_line, signature, content
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9);
-      `, [repoName, activeSha, s.file_path, s.symbol_name, s.symbol_type, s.start_line, s.end_line, s.signature, s.content]);
+    // 4. Fetch symbol edges (callers & callees)
+    const edgesRes = await localPool.query(`
+      SELECT source_symbol, source_path, target_symbol, target_path, relation, line_number
+      FROM code_symbol_edges WHERE repository_id = $1
+    `, [localRepoId]).catch(() => ({ rows: [] }));
+
+    // 5. Execute sync inside a single ACID transaction on remote
+    const client = await remotePool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // Upsert repository in Polygres
+      await client.query(`
+        INSERT INTO pg_git_repositories (name, description)
+        VALUES ($1, $2)
+        ON CONFLICT (name) DO UPDATE SET description = EXCLUDED.description;
+      `, [repoName, repoRes.rows[0].description]);
+
+      // Push commits
+      for (const c of commitsRes.rows) {
+        await client.query(`
+          INSERT INTO pg_git_commits (id, repository_name, tree_id, parent_id, message, author, created_at)
+          VALUES ($1, $2, $3, $4, $5, $6, $7)
+          ON CONFLICT (id) DO NOTHING;
+        `, [c.id, repoName, c.tree_id, c.parent_id, c.message, c.author, c.created_at]);
+      }
+
+      // Replace symbols for this repo atomically
+      await client.query('DELETE FROM pg_git_symbols WHERE repository_name = $1', [repoName]);
+      for (const s of symbolsRes.rows) {
+        await client.query(`
+          INSERT INTO pg_git_symbols (
+            repository_name, commit_sha, file_path, symbol_name, symbol_type, start_line, end_line, signature, content
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9);
+        `, [repoName, activeSha, s.file_path, s.symbol_name, s.symbol_type, s.start_line, s.end_line, s.signature, s.content]);
+      }
+
+      // Replace symbol edges atomically
+      await client.query('DELETE FROM pg_git_symbol_edges WHERE repository_name = $1', [repoName]);
+      for (const e of edgesRes.rows) {
+        await client.query(`
+          INSERT INTO pg_git_symbol_edges (
+            repository_name, commit_sha, source_symbol, source_path, target_symbol, target_path, relation, line_number
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8);
+        `, [repoName, activeSha, e.source_symbol, e.source_path, e.target_symbol, e.target_path, e.relation || 'CALLS', e.line_number]);
+      }
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
     }
 
     return {
       repository: repoName,
       commitSha: activeSha,
       commitsPushed: commitsRes.rows.length,
-      symbolsPushed: symbolsRes.rows.length
+      symbolsPushed: symbolsRes.rows.length,
+      edgesPushed: edgesRes.rows.length
     };
   }
 
@@ -153,20 +212,21 @@ export class GitBridge {
    * Push code blobs to Wondersearch Drive for semantic code search with commit SHA metadata
    */
   async syncCodebaseToWondersearch(repoName, driveName = null, commitSha = 'HEAD') {
-    if (!this.localPool) throw new Error('syncCodebaseToWondersearch() requires localGitDbUrl.');
+    const localPool = this._getLocalPool();
 
     const targetDriveName = driveName || `repo-${repoName}`;
     const driveId = await this.wondersearch.createOrGetDrive(targetDriveName);
 
-    // Save driveId in Polygres repository record if remote pool is available
-    if (this.remotePool) {
-      await this.remotePool.query(`
+    // Save driveId in Polygres repository record if remote pool is configured
+    if (this.polygresUrl) {
+      const remotePool = this._getRemotePool();
+      await remotePool.query(`
         UPDATE pg_git_repositories SET wondersearch_drive_id = $1 WHERE name = $2;
       `, [driveId, repoName]);
     }
 
     // Fetch latest blobs
-    const blobsRes = await this.localPool.query(`
+    const blobsRes = await localPool.query(`
       SELECT b.id, b.file_path, b.file_name, b.content, b.summary
       FROM blobs b
       JOIN repositories r ON b.repository_id = r.id
@@ -209,8 +269,9 @@ export class GitBridge {
    */
   async searchCode(repoName, query, limit = 5, expectedSha = null) {
     let driveId = null;
-    if (this.remotePool) {
-      const res = await this.remotePool.query('SELECT wondersearch_drive_id FROM pg_git_repositories WHERE name = $1', [repoName]);
+    if (this.polygresUrl) {
+      const remotePool = this._getRemotePool();
+      const res = await remotePool.query('SELECT wondersearch_drive_id FROM pg_git_repositories WHERE name = $1', [repoName]);
       if (res.rows.length > 0 && res.rows[0].wondersearch_drive_id) {
         driveId = res.rows[0].wondersearch_drive_id;
       }
@@ -238,11 +299,10 @@ export class GitBridge {
   }
 
   /**
-   * Query AST symbols from Polygres Cloud
+   * Query AST symbols from Polygres Cloud (parameterized SQL, no string interpolation)
    */
   async findSymbols(repoName, query, options = {}) {
-    if (!this.remotePool) throw new Error('findSymbols() requires polygresUrl.');
-    assertCloudAllowed(this.polygresUrl, this.allowCloud);
+    const remotePool = this._getRemotePool();
 
     let sql = `
       SELECT file_path, symbol_name, symbol_type, start_line, end_line, signature, content, commit_sha
@@ -255,9 +315,12 @@ export class GitBridge {
       sql += ` AND commit_sha = $${params.length + 1}`;
       params.push(options.sha);
     }
-    sql += ` ORDER BY symbol_name ASC LIMIT ${options.limit || 20};`;
 
-    const res = await this.remotePool.query(sql, params);
+    const limit = typeof options.limit === 'number' ? options.limit : 20;
+    sql += ` ORDER BY symbol_name ASC LIMIT $${params.length + 1};`;
+    params.push(limit);
+
+    const res = await remotePool.query(sql, params);
     return res.rows;
   }
 
@@ -284,11 +347,10 @@ export class GitBridge {
    * Walk caller and callee dependency graph via recursive relational CTEs
    */
   async getDependencyGraph(repoName, symbolName) {
-    if (!this.remotePool) throw new Error('getDependencyGraph() requires polygresUrl.');
-    assertCloudAllowed(this.polygresUrl, this.allowCloud);
+    const remotePool = this._getRemotePool();
 
     // Inbound callers (who calls this symbol)
-    const inboundRes = await this.remotePool.query(`
+    const inboundRes = await remotePool.query(`
       WITH RECURSIVE callers AS (
         SELECT source_symbol, source_path, target_symbol, target_path, relation, line_number, 1 as depth
         FROM pg_git_symbol_edges
@@ -303,7 +365,7 @@ export class GitBridge {
     `, [repoName, symbolName]);
 
     // Outbound callees (who does this symbol call)
-    const outboundRes = await this.remotePool.query(`
+    const outboundRes = await remotePool.query(`
       WITH RECURSIVE callees AS (
         SELECT source_symbol, source_path, target_symbol, target_path, relation, line_number, 1 as depth
         FROM pg_git_symbol_edges

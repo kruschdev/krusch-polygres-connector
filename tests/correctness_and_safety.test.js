@@ -16,11 +16,11 @@ test('assertMatterNotPrivileged enforces realpath denial for privileged matter p
 
   // 2. Denied paths
   assert.throws(() => {
-    assertMatterNotPrivileged('/home/krusch/homelab/projects/krusch-law/data/matters/matter_001/deposition.yaml');
+    assertMatterNotPrivileged('/opt/workspace/projects/krusch-law/data/matters/matter_001/deposition.yaml');
   }, /AirGapSecurityError/);
 
   assert.throws(() => {
-    assertMatterNotPrivileged('/home/krusch/homelab/projects/krusch-law/evidence/case_44/docs.pdf');
+    assertMatterNotPrivileged('/opt/workspace/projects/krusch-law/evidence/case_44/docs.pdf');
   }, /AirGapSecurityError/);
 
   assert.throws(() => {

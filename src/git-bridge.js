@@ -5,6 +5,7 @@
  */
 
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import pg from 'pg';
@@ -493,8 +494,8 @@ export class GitBridge {
     `, [repoName]);
 
     const candidateRoots = [
-      path.resolve('/home/krusch/homelab/projects', repoName),
-      path.resolve('/home/krusch/homelab', repoName),
+      path.resolve(os.homedir(), 'homelab/projects', repoName),
+      path.resolve(os.homedir(), 'homelab', repoName),
       process.cwd()
     ];
 

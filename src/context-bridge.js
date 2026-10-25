@@ -8,7 +8,8 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import pg from 'pg';
 import { DatabaseSync } from 'node:sqlite';
-import { assertCloudAllowed, SCHEMA_VERSION } from './config.js';
+import { assertCloudAllowed, SCHEMA_VERSION, resolvePolygresUrl, isDebugEnabled } from './config.js';
+import { isEphemeralMode, createMockPolygresPool } from './db-mock.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -89,11 +90,11 @@ export function sanitizeMemoryRecord(record, options = {}) {
 export class ContextBridge {
   constructor(config = {}) {
     this.contextDbPath = config.localContextDbPath;
-    this.polygresUrl = config.polygresUrl !== undefined
-      ? config.polygresUrl
-      : (process.env.POLYGRES_URL || process.env.DATABASE_URL || null);
+    this.polygresUrl = resolvePolygresUrl(config);
     this.allowCloud = config.allowCloud;
+    this.debug = isDebugEnabled(config);
     this.sharedPool = config.sharedRemotePool || null;
+    this.sharedRemotePool = this.sharedPool;
     this.pool = this.sharedPool;
     this.ownsPool = !this.sharedPool;
   }
@@ -104,7 +105,9 @@ export class ContextBridge {
         throw new Error('ContextBridge requires polygresUrl to connect to remote database.');
       }
       assertCloudAllowed(this.polygresUrl, this.allowCloud);
-      this.pool = new pg.Pool({ connectionString: this.polygresUrl });
+      this.pool = isEphemeralMode()
+        ? createMockPolygresPool()
+        : new pg.Pool({ connectionString: this.polygresUrl });
       this.ownsPool = true;
     }
     return this.pool;
@@ -126,7 +129,10 @@ export class ContextBridge {
     let sql;
     try {
       sql = fs.readFileSync(schemaPath, 'utf8');
-    } catch {
+    } catch (err) {
+      if (this.debug) {
+        console.warn(`[ContextBridge] Schema file read fallback (${schemaPath}): ${err.message}`);
+      }
       // Fallback inline schema if file read fails
       sql = `
         CREATE TABLE IF NOT EXISTS pg_context_items (
@@ -210,7 +216,13 @@ export class ContextBridge {
       throw new Error(`[ContextBridge] Local SQLite database at '${this.contextDbPath}' corrupt or unreadable: ${err.message}`);
     } finally {
       if (db) {
-        try { db.close(); } catch {}
+        try {
+          db.close();
+        } catch (closeErr) {
+          if (this.debug) {
+            console.warn(`[ContextBridge] db.close() warning: ${closeErr.message}`);
+          }
+        }
       }
     }
   }
@@ -388,7 +400,11 @@ export class ContextBridge {
             SET status = 'failed', error_message = $1, finished_at = CURRENT_TIMESTAMP
             WHERE id = $2;
           `, [err.message, syncRunId]);
-        } catch {}
+        } catch (updateErr) {
+          if (this.debug) {
+            console.warn(`[ContextBridge] Failed updating sync_runs status: ${updateErr.message}`);
+          }
+        }
       }
       throw err;
     } finally {
@@ -425,7 +441,11 @@ export class ContextBridge {
           `, [workspaceName]);
           return altRes.rows;
         }
-      } catch {}
+      } catch (fallbackErr) {
+        if (this.debug) {
+          console.warn(`[ContextBridge] pullRemoteContext fallback warning: ${fallbackErr.message}`);
+        }
+      }
     }
 
     return res.rows;
@@ -489,7 +509,11 @@ export class ContextBridge {
         const altRes = await pool.query(altSql, altParams);
         return altRes.rows;
       }
-    } catch {}
+    } catch (fallbackErr) {
+      if (this.debug) {
+        console.warn(`[ContextBridge] queryRemoteContext fallback warning: ${fallbackErr.message}`);
+      }
+    }
 
     return [];
   }

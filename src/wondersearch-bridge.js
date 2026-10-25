@@ -7,15 +7,13 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import { assertCloudAllowed, assertMatterNotPrivileged } from './config.js';
+import { assertCloudAllowed, assertMatterNotPrivileged, getWondersearchConfig, isDebugEnabled } from './config.js';
 
 export class WondersearchBridge {
   constructor(config = {}) {
-    this.apiKey = config.wondersearchApiKey !== undefined ? config.wondersearchApiKey : (process.env.WONDERSEARCH_API_KEY || null);
-    this.baseUrl = (config.wondersearchBaseUrl || process.env.WONDERSEARCH_BASE_URL || 'https://api.wondersearch.ai').replace(/\/+$/, '');
-    this.workspaceId = config.wondersearchWorkspaceId || process.env.WONDERSEARCH_WORKSPACE_ID || null;
-    this.defaultDriveId = config.wondersearchDefaultDriveId || process.env.WONDERSEARCH_DEFAULT_DRIVE_ID || null;
-    this.allowCloud = config.allowCloud;
+    const cfg = getWondersearchConfig(config);
+    Object.assign(this, cfg);
+    this.debug = config.debug;
     this.timeoutMs = config.timeoutMs || 15000;
     this.concurrency = config.concurrency || 6;
     this.driveCache = new Map();
@@ -57,6 +55,14 @@ export class WondersearchBridge {
           ...options,
           signal: AbortSignal.timeout(this.timeoutMs)
         });
+
+        if (res.status === 409 && url.endsWith('/search')) {
+          if (attempt < Math.max(maxRetries, 8)) {
+            attempt++;
+            await new Promise(r => setTimeout(r, 1500));
+            continue;
+          }
+        }
 
         if (res.status === 429 || (res.status >= 500 && res.status <= 504)) {
           if (attempt < maxRetries) {
@@ -103,7 +109,9 @@ export class WondersearchBridge {
    */
   async search({ driveId, query, effort = 'medium', limit = 5, groupByDocument = true, folderId = null }) {
     if (!driveId && !this.workspaceId) {
-      await this.getWorkspaceContext().catch(() => {});
+      await this.getWorkspaceContext().catch(err => {
+        if (isDebugEnabled(this)) console.warn(`[WondersearchBridge] getWorkspaceContext fallback in search(): ${err.message}`);
+      });
     }
     const targetDriveId = driveId || this.defaultDriveId;
     let url;
@@ -115,10 +123,10 @@ export class WondersearchBridge {
       throw new Error('search() requires either a driveId or a configured workspaceId.');
     }
 
+    const clampedLimit = Math.min(Math.max(1, limit), 100);
     const payload = {
       query,
       effort,
-      limit: Math.min(Math.max(1, limit), 100),
       group_by_document: groupByDocument
     };
     if (folderId) payload.folder_id = folderId;
@@ -138,7 +146,7 @@ export class WondersearchBridge {
     return {
       requestId: data.request_id,
       driveId: data.drive_id,
-      results: (data.results || []).map(r => ({
+      results: (data.results || []).slice(0, clampedLimit).map(r => ({
         documentId: r.document_id,
         externalId: r.external_id,
         revision: r.document_revision,
@@ -219,7 +227,9 @@ export class WondersearchBridge {
       return this.driveCache.get(driveName);
     }
     if (!this.workspaceId) {
-      await this.getWorkspaceContext().catch(() => {});
+      await this.getWorkspaceContext().catch(err => {
+        if (isDebugEnabled(this)) console.warn(`[WondersearchBridge] getWorkspaceContext fallback in createOrGetDrive(): ${err.message}`);
+      });
     }
     if (!this.workspaceId) {
       throw new Error('createOrGetDrive() requires WONDERSEARCH_WORKSPACE_ID.');

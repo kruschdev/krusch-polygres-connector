@@ -40,20 +40,29 @@ test('Wondersearch Live: createOrGetDrive resolves existing drive and caches dri
   }
 });
 
-test('Wondersearch Live: search retrieves code passages with byte spans, SHA pinning, and scores', async () => {
+test('Wondersearch Live: search retrieves code passages with byte spans, SHA pinning, and scores', async (t) => {
   const config = loadConfig();
   if (!config.wondersearchApiKey) return;
 
   const bridge = new WondersearchBridge(config);
   try {
     const driveId = await bridge.createOrGetDrive('repo-krusch-git');
-    const res = await bridge.search({
-      driveId,
-      query: 'AST symbol chunker',
-      limit: 3,
-      effort: 'medium',
-      groupByDocument: true
-    });
+    let res;
+    try {
+      res = await bridge.search({
+        driveId,
+        query: 'AST symbol chunker',
+        limit: 3,
+        effort: 'medium',
+        groupByDocument: true
+      });
+    } catch (err) {
+      if (/\b(?:502|503|504)\b|temporarily_unavailable/i.test(err.message)) {
+        t.skip(`Wondersearch cloud API temporarily unavailable: ${err.message}`);
+        return;
+      }
+      throw err;
+    }
 
     assert.ok(res.requestId, 'Response should contain requestId');
     assert.strictEqual(res.driveId, driveId, 'Returned driveId should match query drive');
@@ -77,7 +86,7 @@ test('Wondersearch Live: search retrieves code passages with byte spans, SHA pin
   }
 });
 
-test('Wondersearch Live: batch document ingestion succeeds for non-privileged code passages', async () => {
+test('Wondersearch Live: batch document ingestion succeeds for non-privileged code passages', async (t) => {
   const config = loadConfig();
   if (!config.wondersearchApiKey) return;
 
@@ -87,20 +96,29 @@ test('Wondersearch Live: batch document ingestion succeeds for non-privileged co
     const testDocId = `test://synthetic-${Date.now()}`;
     const testText = `export function testWondersearchIntegration() {\n  return "Wondersearch live test verified";\n}`;
 
-    const ingestRes = await bridge.ingestDocuments({
-      driveId,
-      documents: [
-        {
-          externalId: testDocId,
-          text: testText,
-          metadata: {
-            domain: 'testing',
-            test_run: true,
-            indexed_by: '@krusch/polygres-connector'
+    let ingestRes;
+    try {
+      ingestRes = await bridge.ingestDocuments({
+        driveId,
+        documents: [
+          {
+            externalId: testDocId,
+            text: testText,
+            metadata: {
+              domain: 'testing',
+              test_run: true,
+              indexed_by: '@krusch/polygres-connector'
+            }
           }
-        }
-      ]
-    });
+        ]
+      });
+    } catch (err) {
+      if (/\b(?:502|503|504)\b|temporarily_unavailable/i.test(err.message)) {
+        t.skip(`Wondersearch cloud API temporarily unavailable: ${err.message}`);
+        return;
+      }
+      throw err;
+    }
 
     assert.ok(ingestRes, 'Ingestion response should be defined');
   } finally {

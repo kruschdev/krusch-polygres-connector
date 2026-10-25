@@ -3,7 +3,7 @@
  * CLI launcher for @krusch/polygres-connector
  */
 
-import { createPolygresConnector } from '../src/index.js';
+import { createPolygresConnector, validateCliString, validatePolygresUrl } from '../src/index.js';
 import { maskUrl, maskToken, SCHEMA_VERSION } from '../src/config.js';
 
 const rawArgs = process.argv.slice(2);
@@ -61,9 +61,15 @@ Environment Variables:
 }
 
 async function main() {
-  const connector = createPolygresConnector();
+  let connector = null;
 
   try {
+    validateCliString('command', command);
+    if (process.env.POLYGRES_URL) {
+      validatePolygresUrl(process.env.POLYGRES_URL);
+    }
+    connector = createPolygresConnector();
+
     switch (command) {
       case 'status': {
         const probe = await connector.probeStatus();
@@ -97,7 +103,7 @@ async function main() {
       }
 
       case 'sync-context': {
-        const workspace = positionalArgs[1] || 'homelab';
+        const workspace = validateCliString('workspace', positionalArgs[1] || 'homelab');
         if (!isJson) {
           console.log(`Syncing working memory for workspace '${workspace}' (dryRun: ${isDryRun})...`);
         }
@@ -111,14 +117,14 @@ async function main() {
       }
 
       case 'pull-context': {
-        const workspace = positionalArgs[1] || 'homelab';
+        const workspace = validateCliString('workspace', positionalArgs[1] || 'homelab');
         const items = await connector.context.pullRemoteContext(workspace);
         let written = 0;
-        if (isWriteBack) {
+        if (isWriteBack && !isDryRun) {
           written = connector.context.writeLocalEntries(items);
         }
         if (isJson) {
-          console.log(JSON.stringify({ workspace, count: items.length, writtenToLocal: written, items }, null, 2));
+          console.log(JSON.stringify({ workspace, count: items.length, writtenToLocal: written, dryRun: isDryRun, items }, null, 2));
         } else {
           console.log(`Found ${items.length} active items for workspace '${workspace}':`);
           for (const item of items) {
@@ -133,11 +139,12 @@ async function main() {
 
       case 'sync-git': {
         const repoName = positionalArgs[1];
-        const sha = positionalArgs[2] || null;
+        const sha = positionalArgs[2] ? validateCliString('commit_sha', positionalArgs[2]) : null;
         if (!repoName) {
           console.error('Error: specify a repository name: krusch-polygres sync-git <repo_name> [commit_sha] [--dry-run]');
           process.exit(1);
         }
+        validateCliString('repo_name', repoName);
         if (!isJson) {
           console.log(`Syncing Git DAG & AST symbols for '${repoName}' (dryRun: ${isDryRun})...`);
         }
@@ -167,6 +174,8 @@ async function main() {
           console.error('Error: specify repo and symbol: krusch-polygres find-symbol <repo_name> <symbol_name>');
           process.exit(1);
         }
+        validateCliString('repo_name', repoName);
+        validateCliString('symbol', symbolName, { allowRelativeSymbolPath: true });
         const symbol = await connector.git.findSymbol(repoName, symbolName);
         if (isJson) {
           console.log(JSON.stringify(symbol, null, 2));
@@ -189,6 +198,9 @@ async function main() {
           console.error('Error: specify repo and symbol: krusch-polygres symbol-context <repo_name> <symbol_name> [workspace]');
           process.exit(1);
         }
+        validateCliString('repo_name', repoName);
+        validateCliString('symbol', symbolName, { allowRelativeSymbolPath: true });
+        validateCliString('workspace', workspace);
 
         const symContext = await connector.getSymbolContext({
           repoName,
@@ -258,6 +270,8 @@ async function main() {
           console.error('Error: specify repo and symbol: krusch-polygres dep-graph <repo_name> <symbol_name>');
           process.exit(1);
         }
+        validateCliString('repo_name', repoName);
+        validateCliString('symbol', symbolName, { allowRelativeSymbolPath: true });
 
         const graph = await connector.git.getDependencyGraph(repoName, symbolName);
         if (isJson) {
@@ -293,6 +307,9 @@ async function main() {
           console.error('Error: specify repo and symbol: krusch-polygres blast-radius <repo_name> <symbol_name> [workspace]');
           process.exit(1);
         }
+        validateCliString('repo_name', repoName);
+        validateCliString('symbol', symbolName, { allowRelativeSymbolPath: true });
+        validateCliString('workspace', workspace);
 
         const blast = await connector.traceBlastRadiusWithInvariants({
           repoName,
@@ -329,6 +346,10 @@ async function main() {
           console.error('Error: specify repo and symbol: krusch-polygres audit-refactor <repo_name> <symbol_name> [action] [workspace]');
           process.exit(1);
         }
+        validateCliString('repo_name', repoName);
+        validateCliString('symbol', symbolName, { allowRelativeSymbolPath: true });
+        validateCliString('action', action);
+        validateCliString('workspace', workspace);
 
         const audit = await connector.auditSymbolRefactor({
           repoName,
@@ -362,6 +383,8 @@ async function main() {
           console.error('Error: specify repo name: krusch-polygres cross-query <repo_name> [workspace]');
           process.exit(1);
         }
+        validateCliString('repo_name', repoName);
+        validateCliString('workspace', workspace);
 
         const rows = await connector.queryCrossSubstrate({
           repoName,
@@ -384,15 +407,18 @@ async function main() {
 
       case 'sync-code': {
         const repoName = positionalArgs[1];
-        const sha = positionalArgs[2] || null;
+        const sha = positionalArgs[2] ? validateCliString('commit_sha', positionalArgs[2]) : null;
         if (!repoName) {
-          console.error('Error: specify a repository name: krusch-polygres sync-code <repo_name> [commit_sha]');
+          console.error('Error: specify a repository name: krusch-polygres sync-code <repo_name> [commit_sha] [--dry-run]');
           process.exit(1);
         }
+        validateCliString('repo_name', repoName);
         if (!isJson) {
-          console.log(`Syncing codebase blobs to Wondersearch drive for '${repoName}'...`);
+          console.log(`Syncing codebase blobs to Wondersearch drive for '${repoName}' (dryRun: ${isDryRun})...`);
         }
-        const wsRes = await connector.git.syncCodebaseToWondersearch(repoName, null, sha);
+        const wsRes = isDryRun
+          ? { dryRun: true, repoName, commitSha: sha, documentsIndexed: 0, driveId: 'dry-run' }
+          : await connector.git.syncCodebaseToWondersearch(repoName, null, sha);
         if (isJson) {
           console.log(JSON.stringify(wsRes, null, 2));
         } else {
@@ -408,6 +434,7 @@ async function main() {
           console.error('Error: specify repo and query: krusch-polygres search-code <repo_name> <query>');
           process.exit(1);
         }
+        validateCliString('repo_name', repoName);
         const searchRes = await connector.git.searchCode(repoName, query);
         if (isJson) {
           console.log(JSON.stringify(searchRes, null, 2));
@@ -423,7 +450,9 @@ async function main() {
 
       case 'sync-biz': {
         const playbooksDir = positionalArgs[1] || './data/playbooks';
-        const res = await connector.wondersearch.syncPlaybooks(playbooksDir);
+        const res = isDryRun
+          ? { dryRun: true, playbooksDir, documentsIndexed: 0, driveId: 'dry-run' }
+          : await connector.wondersearch.syncPlaybooks(playbooksDir);
         if (isJson) {
           console.log(JSON.stringify(res, null, 2));
         } else {
@@ -457,15 +486,17 @@ async function main() {
       }
     }
   } catch (err) {
+    process.exitCode = 1;
     if (isJson) {
       console.error(JSON.stringify({ error: err.message }, null, 2));
     } else {
       console.error(`❌ Error: ${err.message}`);
     }
-    process.exit(1);
   } finally {
-    await connector.close();
-    process.exit(0);
+    if (connector) {
+      await connector.close();
+    }
+    process.exit(process.exitCode || 0);
   }
 }
 

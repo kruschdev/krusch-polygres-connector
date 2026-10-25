@@ -11,6 +11,7 @@ import { fileURLToPath } from 'url';
 import pg from 'pg';
 import { WondersearchBridge } from './wondersearch-bridge.js';
 import { assertCloudAllowed, SCHEMA_VERSION } from './config.js';
+import { isEphemeralMode, createMockPolygresPool } from './db-mock.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -38,7 +39,9 @@ export class GitBridge {
       if (!this.localDbUrl) {
         throw new Error('GitBridge requires localGitDbUrl to access local repository database.');
       }
-      this.localPool = new pg.Pool({ connectionString: this.localDbUrl });
+      this.localPool = isEphemeralMode()
+        ? createMockPolygresPool()
+        : new pg.Pool({ connectionString: this.localDbUrl });
     }
     return this.localPool;
   }
@@ -49,7 +52,9 @@ export class GitBridge {
         throw new Error('GitBridge requires polygresUrl to access remote database.');
       }
       assertCloudAllowed(this.polygresUrl, this.allowCloud);
-      this.remotePool = new pg.Pool({ connectionString: this.polygresUrl });
+      this.remotePool = isEphemeralMode()
+        ? createMockPolygresPool()
+        : new pg.Pool({ connectionString: this.polygresUrl });
       this.ownsRemotePool = true;
     }
     return this.remotePool;
@@ -444,7 +449,9 @@ export class GitBridge {
             SET status = 'failed', error_message = $1, finished_at = CURRENT_TIMESTAMP
             WHERE id = $2;
           `, [err.message, syncRunId]);
-        } catch {}
+        } catch (updateErr) {
+          console.warn(`[GitBridge] Failed to record failed status for sync_run ${syncRunId}: ${updateErr.message}`);
+        }
       }
       throw err;
     } finally {
@@ -512,8 +519,11 @@ export class GitBridge {
             try {
               text = fs.readFileSync(diskPath, 'utf8');
               break;
-            } catch {}
+            } catch (err) {
+              console.error(`[GitBridge] Failed to read file (${diskPath}):`, err.message);
+            }
           }
+
         }
       }
       if (!text && b.summary) text = b.summary;

@@ -9,11 +9,46 @@ import { loadConfig, assertCloudAllowed, SCHEMA_VERSION } from './config.js';
 import { ContextBridge } from './context-bridge.js';
 import { GitBridge } from './git-bridge.js';
 import { WondersearchBridge } from './wondersearch-bridge.js';
+import { isEphemeralMode, createMockPolygresPool } from './db-mock.js';
 
 export { loadConfig, SCHEMA_VERSION } from './config.js';
 export { ContextBridge } from './context-bridge.js';
 export { GitBridge } from './git-bridge.js';
 export { WondersearchBridge } from './wondersearch-bridge.js';
+
+export class ConfigurationError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'ConfigurationError';
+  }
+}
+
+export function validatePolygresUrl(url) {
+  if (!url || typeof url !== 'string') {
+    throw new ConfigurationError('Polygres URL is required to obtain a remote pool');
+  }
+  try {
+    const parsed = new URL(url);
+    if (!parsed.protocol.startsWith('postgres')) {
+      throw new ConfigurationError('polygresUrl must use postgres:// or postgresql:// protocol');
+    }
+  } catch (err) {
+    if (err instanceof ConfigurationError) throw err;
+    throw new ConfigurationError('polygresUrl must be a valid URL');
+  }
+}
+
+export function validateCliString(name, value, { allowRelativeSymbolPath = false } = {}) {
+  if (!value || typeof value !== 'string') {
+    throw new ConfigurationError(`${name} is invalid: must be a non-empty string`);
+  }
+  const trimmed = value.trim();
+  const pattern = allowRelativeSymbolPath ? /^[\w./@-]+$/ : /^[\w.-]+$/;
+  if (!trimmed || !pattern.test(trimmed) || (!allowRelativeSymbolPath && trimmed.includes('..'))) {
+    throw new ConfigurationError(`${name} is invalid: contains disallowed characters`);
+  }
+  return trimmed;
+}
 
 /**
  * Convenience factory to create a fully configured connector instance
@@ -22,26 +57,71 @@ export { WondersearchBridge } from './wondersearch-bridge.js';
 export function createPolygresConnector(options = {}) {
   const config = loadConfig(options);
 
-  let sharedRemotePool = null;
-  const getSharedRemotePool = () => {
-    if (!sharedRemotePool && config.polygresUrl) {
-      assertCloudAllowed(config.polygresUrl, config.allowCloud);
-      sharedRemotePool = new pg.Pool({ connectionString: config.polygresUrl });
+  const remotePoolState = {
+    pool: null,
+    initPromise: null
+  };
+
+  const instantiateRemotePool = () => {
+    validatePolygresUrl(config.polygresUrl);
+    assertCloudAllowed(config.polygresUrl, config.allowCloud);
+    const pool = isEphemeralMode()
+      ? createMockPolygresPool()
+      : new pg.Pool({ connectionString: config.polygresUrl });
+    if (typeof pool.on === 'function') {
+      pool.on('error', (err) => {
+        console.error('[PolygresConnector] Remote pool error:', err.message);
+        process.emit('polygresPoolError', err);
+        if (typeof pool.end === 'function') {
+          Promise.resolve(pool.end()).catch(() => {});
+        }
+        if (remotePoolState.pool === pool) {
+          remotePoolState.pool = null;
+          remotePoolState.initPromise = null;
+        }
+      });
     }
-    return sharedRemotePool;
+    return pool;
+  };
+
+  const getSharedRemotePool = () => {
+    if (!remotePoolState.pool) {
+      const pool = instantiateRemotePool();
+      remotePoolState.pool = pool;
+      remotePoolState.initPromise = Promise.resolve(pool);
+    }
+    return remotePoolState.pool;
+  };
+
+  const getSharedRemotePoolAsync = async () => {
+    if (remotePoolState.pool) {
+      return remotePoolState.pool;
+    }
+    if (!remotePoolState.initPromise) {
+      remotePoolState.initPromise = Promise.resolve().then(() => {
+        if (!remotePoolState.pool) {
+          remotePoolState.pool = instantiateRemotePool();
+        }
+        return remotePoolState.pool;
+      }).catch((err) => {
+        remotePoolState.initPromise = null;
+        throw err;
+      });
+    }
+    return remotePoolState.initPromise;
   };
 
   const context = new ContextBridge({
     ...config,
     get sharedRemotePool() {
-      return getSharedRemotePool();
+      return config.polygresUrl ? getSharedRemotePool() : null;
     }
   });
 
   const git = new GitBridge({
     ...config,
     get sharedRemotePool() {
-      return getSharedRemotePool();
+      return config.polygresUrl ? getSharedRemotePool() : null;
     }
   });
 
@@ -52,6 +132,8 @@ export function createPolygresConnector(options = {}) {
     context,
     git,
     wondersearch,
+    getSharedRemotePool,
+    getSharedRemotePoolAsync,
     schemaVersion: SCHEMA_VERSION,
 
     /**
@@ -100,10 +182,16 @@ export function createPolygresConnector(options = {}) {
             const tableRes = await pool.query(`
               SELECT table_name FROM information_schema.tables
               WHERE table_schema = 'public' AND table_name LIKE 'pg_git_%' OR table_name = 'pg_context_items';
-            `).catch(() => ({ rows: [] }));
+            `).catch((err) => {
+              if (process.env.KRUSCH_DEBUG) console.warn(`[PolygresDoctor] information_schema query warning: ${err.message}`);
+              return { rows: [] };
+            });
             report.remotePostgres.tables = tableRes.rows.map(r => r.table_name);
 
-            const runsRes = await pool.query('SELECT COUNT(*) as runs FROM sync_runs;').catch(() => null);
+            const runsRes = await pool.query('SELECT COUNT(*) as runs FROM sync_runs;').catch((err) => {
+              if (process.env.KRUSCH_DEBUG) console.warn(`[PolygresDoctor] sync_runs count warning: ${err.message}`);
+              return null;
+            });
             if (runsRes) {
               report.remotePostgres.syncRuns = parseInt(runsRes.rows[0].runs, 10);
             }
@@ -116,7 +204,10 @@ export function createPolygresConnector(options = {}) {
       // 4. Wondersearch probe
       if (config.wondersearchApiKey) {
         try {
-          const wsContext = await wondersearch.getWorkspaceContext().catch(() => ({}));
+          const wsContext = await wondersearch.getWorkspaceContext().catch((err) => {
+            if (process.env.KRUSCH_DEBUG) console.warn(`[PolygresDoctor] getWorkspaceContext fallback warning: ${err.message}`);
+            return {};
+          });
           const targetWorkspaceId = config.wondersearchWorkspaceId || wsContext.workspaceId;
           if (targetWorkspaceId) {
             const listUrl = `${wondersearch.baseUrl}/v1/workspaces/${targetWorkspaceId}/drives`;
@@ -165,12 +256,19 @@ export function createPolygresConnector(options = {}) {
       const symbolQuery = symbolName.replace(/^[./\\]+/, '');
       const filePath = symbol?.file_path || '';
 
-      const [symbolInvariants, fileInvariants, generalInvariants, activeBlockers] = await Promise.all([
+      const [symbolInvariants, fileInvariants, generalInvariants, rawBlockers] = await Promise.all([
         context.queryRemoteContext({ workspaceName: targetWorkspace, query: symbolQuery, category: 'invariant', limit: 20 }),
         filePath ? context.queryRemoteContext({ workspaceName: targetWorkspace, query: filePath, limit: 20 }) : Promise.resolve([]),
         context.queryRemoteContext({ workspaceName: targetWorkspace, category: 'invariant', limit: 20 }),
         context.queryRemoteContext({ workspaceName: targetWorkspace, query: symbolQuery, category: 'blocker', limit: 10 })
       ]);
+      const activeBlockers = rawBlockers.filter((b) => {
+        const match = String(b.content || '').match(/^\[([a-zA-Z0-9_.-]+)\]/);
+        if (match && match[1] && match[1] !== repoName) {
+          return false;
+        }
+        return true;
+      });
 
       // Deduplicate items
       const seenIds = new Set();
@@ -340,10 +438,13 @@ export function createPolygresConnector(options = {}) {
       await context.close();
       await git.close();
       await wondersearch.close();
-      if (sharedRemotePool) {
-        await sharedRemotePool.end();
-        sharedRemotePool = null;
+      const activePool = remotePoolState.pool || (remotePoolState.initPromise ? await remotePoolState.initPromise.catch(() => null) : null);
+      remotePoolState.pool = null;
+      remotePoolState.initPromise = null;
+      if (activePool) {
+        await activePool.end();
       }
     }
   };
 }
+

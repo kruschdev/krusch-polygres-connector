@@ -25,7 +25,8 @@ export function isPrivateOrLocalHost(target) {
     } else {
       hostname = target.split(':')[0];
     }
-  } catch {
+  } catch (err) {
+    console.error('[Config] Invalid URL:', err.message);
     hostname = target;
   }
 
@@ -100,7 +101,8 @@ export function assertMatterNotPrivileged(targetPath) {
   let resolvedPath = targetPath;
   try {
     resolvedPath = fs.realpathSync(targetPath);
-  } catch {
+  } catch (err) {
+    console.warn('[config] realpathSync failed:', err.message);
     resolvedPath = path.resolve(targetPath);
   }
 
@@ -148,9 +150,22 @@ export function maskToken(token) {
   return token.substring(0, 4) + '...' + token.substring(token.length - 4);
 }
 
+export class ConfigurationError extends Error {
+  constructor(message, cause = undefined) {
+    super(message);
+    this.name = 'ConfigurationError';
+    if (cause !== undefined) {
+      this.cause = cause;
+    }
+  }
+}
+
 export function loadConfig(overrides = {}) {
-  // Lightweight .env loader if .env exists in cwd
-  const envPath = path.resolve(process.cwd(), '.env');
+  const fileEnv = {};
+  const envPath = overrides.envPath
+    ? path.resolve(overrides.envPath)
+    : path.resolve(process.cwd(), '.env');
+
   if (fs.existsSync(envPath)) {
     try {
       const lines = fs.readFileSync(envPath, 'utf8').split('\n');
@@ -160,31 +175,55 @@ export function loadConfig(overrides = {}) {
         const [k, ...v] = trimmed.split('=');
         const key = k.trim();
         const val = v.join('=').trim().replace(/^["']|["']$/g, '');
-        if (!process.env[key]) {
-          process.env[key] = val;
+        if (key) {
+          fileEnv[key] = val;
         }
       }
-    } catch {}
+    } catch (err) {
+      console.warn(`[PolygresConfig] Failed reading .env at ${envPath}: ${err.message}`);
+      throw new ConfigurationError(`Failed reading .env at ${envPath}: ${err.message}`, err);
+    }
   }
 
-  const localGitDbUrl = overrides.localGitDbUrl || process.env.KRUSCH_GIT_DATABASE_URL || 'postgresql://kdcode:password@localhost:5432/kdcode';
+  const getEnv = (key) =>
+    Object.prototype.hasOwnProperty.call(process.env, key) ? process.env[key] : fileEnv[key];
+
+  const gitDbPassword = overrides.gitDbPassword ?? getEnv('KRUSCH_GIT_DB_PASSWORD');
+  if (
+    overrides.requireGitDbPassword &&
+    !overrides.localGitDbUrl &&
+    !getEnv('KRUSCH_GIT_DATABASE_URL') &&
+    !gitDbPassword
+  ) {
+    throw new ConfigurationError(
+      'Missing required database credentials: set KRUSCH_GIT_DATABASE_URL or KRUSCH_GIT_DB_PASSWORD'
+    );
+  }
+
+  const defaultLocalGitDbUrl = gitDbPassword
+    ? `postgresql://kdcode:${encodeURIComponent(gitDbPassword)}@localhost:5432/kdcode`
+    : 'postgresql://localhost:5432/kdcode';
+
+  const localGitDbUrl =
+    overrides.localGitDbUrl || getEnv('KRUSCH_GIT_DATABASE_URL') || defaultLocalGitDbUrl;
 
   const polygresUrl = overrides.polygresUrl !== undefined
     ? overrides.polygresUrl
-    : (process.env.POLYGRES_URL || process.env.DATABASE_URL || process.env.KRUSCH_GIT_DATABASE_URL || localGitDbUrl);
-  const polygresApiKey = overrides.polygresApiKey || process.env.POLYGRES_API_KEY || null;
+    : (getEnv('POLYGRES_URL') || getEnv('DATABASE_URL') || getEnv('KRUSCH_GIT_DATABASE_URL') || localGitDbUrl);
+  const polygresApiKey = overrides.polygresApiKey || getEnv('POLYGRES_API_KEY') || null;
 
   // Separate Wondersearch credentials; do not reuse polygresApiKey by default
-  const wondersearchApiKey = overrides.wondersearchApiKey || process.env.WONDERSEARCH_API_KEY || null;
-  const wondersearchBaseUrl = (overrides.wondersearchBaseUrl || process.env.WONDERSEARCH_BASE_URL || 'https://api.wondersearch.ai').replace(/\/+$/, '');
-  const wondersearchWorkspaceId = overrides.wondersearchWorkspaceId || process.env.WONDERSEARCH_WORKSPACE_ID || null;
-  const wondersearchDefaultDriveId = overrides.wondersearchDefaultDriveId || process.env.WONDERSEARCH_DEFAULT_DRIVE_ID || null;
+  const wondersearchApiKey = overrides.wondersearchApiKey || getEnv('WONDERSEARCH_API_KEY') || null;
+  const wondersearchBaseUrl = (overrides.wondersearchBaseUrl || getEnv('WONDERSEARCH_BASE_URL') || 'https://api.wondersearch.ai').replace(/\/+$/, '');
+  const wondersearchWorkspaceId = overrides.wondersearchWorkspaceId || getEnv('WONDERSEARCH_WORKSPACE_ID') || null;
+  const wondersearchDefaultDriveId = overrides.wondersearchDefaultDriveId || getEnv('WONDERSEARCH_DEFAULT_DRIVE_ID') || null;
 
-  const localContextDbPath = overrides.localContextDbPath || process.env.KRUSCH_CONTEXT_DB_PATH || path.resolve(process.cwd(), '.agent/context.db');
+  const localContextDbPath = overrides.localContextDbPath || getEnv('KRUSCH_CONTEXT_DB_PATH') || path.resolve(process.cwd(), '.agent/context.db');
 
+  const rawAllowCloud = getEnv('ALLOW_CLOUD');
   const allowCloud = overrides.allowCloud !== undefined
     ? Boolean(overrides.allowCloud)
-    : (process.env.ALLOW_CLOUD === '1' || process.env.ALLOW_CLOUD === 'true');
+    : (rawAllowCloud === '1' || rawAllowCloud === 'true');
 
   return {
     polygresUrl,
@@ -199,3 +238,71 @@ export function loadConfig(overrides = {}) {
     ...overrides
   };
 }
+
+export function resolvePolygresUrl(config = {}, env = process.env) {
+  if (config.polygresUrl !== undefined) {
+    return config.polygresUrl;
+  }
+  return env.POLYGRES_URL || env.DATABASE_URL || null;
+}
+
+export function isDebugEnabled(config = {}, env = process.env) {
+  if (config.debug !== undefined) {
+    return Boolean(config.debug);
+  }
+  return Boolean(env.KRUSCH_DEBUG);
+}
+
+export function getWondersearchConfig(config = {}, env = process.env) {
+  const rawApiKey = config.wondersearchApiKey !== undefined
+    ? config.wondersearchApiKey
+    : (config.apiKey !== undefined ? config.apiKey : (env.WONDERSEARCH_API_KEY || null));
+
+  if (rawApiKey !== null && (typeof rawApiKey !== 'string' || rawApiKey.trim() === '')) {
+    throw new ConfigurationError('Invalid Wondersearch API key: must be a non-empty string');
+  }
+  if (config.requireApiKey && !rawApiKey) {
+    throw new ConfigurationError('Missing required Wondersearch API key (WONDERSEARCH_API_KEY)');
+  }
+
+  const rawBaseUrl = config.wondersearchBaseUrl || config.baseUrl || env.WONDERSEARCH_BASE_URL || 'https://api.wondersearch.ai';
+  if (typeof rawBaseUrl !== 'string' || !rawBaseUrl.trim()) {
+    throw new ConfigurationError('Invalid Wondersearch baseUrl: must be a non-empty URL string');
+  }
+
+  const baseUrl = rawBaseUrl.trim().replace(/\/+$/, '');
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(baseUrl);
+  } catch (err) {
+    throw new ConfigurationError(`Invalid Wondersearch baseUrl '${baseUrl}': ${err.message}`, err);
+  }
+
+  if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
+    throw new ConfigurationError(`Invalid Wondersearch baseUrl protocol '${parsedUrl.protocol}': must be http: or https:`);
+  }
+
+  if (Array.isArray(config.allowedHosts) && config.allowedHosts.length > 0) {
+    const host = parsedUrl.hostname.toLowerCase();
+    const allowed = config.allowedHosts.map((h) => String(h).toLowerCase());
+    if (!allowed.includes(host)) {
+      throw new ConfigurationError(`Wondersearch host '${host}' is not in allowedHosts whitelist`);
+    }
+  }
+
+  const workspaceId = config.wondersearchWorkspaceId || config.workspaceId || env.WONDERSEARCH_WORKSPACE_ID || null;
+  const defaultDriveId = config.wondersearchDefaultDriveId || config.defaultDriveId || env.WONDERSEARCH_DEFAULT_DRIVE_ID || null;
+  const allowCloud = config.allowCloud !== undefined
+    ? config.allowCloud
+    : (env.ALLOW_CLOUD === '1' || env.ALLOW_CLOUD === 'true' ? true : undefined);
+
+  return {
+    apiKey: rawApiKey ? rawApiKey.trim() : null,
+    baseUrl,
+    workspaceId,
+    defaultDriveId,
+    allowCloud
+  };
+}
+
+

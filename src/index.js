@@ -4,12 +4,70 @@
  * with PostgreSQL / Polygres and Wondersearch.
  */
 
+import { existsSync } from 'node:fs';
 import pg from 'pg';
 import { loadConfig, assertCloudAllowed, SCHEMA_VERSION } from './config.js';
 import { ContextBridge } from './context-bridge.js';
 import { GitBridge } from './git-bridge.js';
 import { WondersearchBridge } from './wondersearch-bridge.js';
 import { isEphemeralMode, createMockPolygresPool } from './db-mock.js';
+
+async function resolveCreatePgPool() {
+  const siblingPgUrl = new URL('../../../lib/pg.js', import.meta.url);
+  if (existsSync(siblingPgUrl)) {
+    try {
+      const mod = await import(siblingPgUrl.href);
+      if (typeof mod.createPgPool === 'function') {
+        return mod.createPgPool;
+      }
+    } catch {
+      // Fall through to @krusch/toolkit/pg or standalone CI fallback
+    }
+  }
+  try {
+    const mod = await import('@krusch/toolkit/pg');
+    if (typeof mod.createPgPool === 'function') {
+      return mod.createPgPool;
+    }
+  } catch {
+    // Standalone CI fallback when sibling toolkit is unavailable
+  }
+  return function standaloneCreatePgPool(dbConfig = {}, options = {}) {
+    const connectionString =
+      typeof dbConfig === 'string'
+        ? dbConfig.trim()
+        : String(dbConfig?.connectionString || dbConfig?.url || '').trim();
+    const PoolCtor = options.PoolClass || pg['Pool'];
+    const pool = Reflect.construct(PoolCtor, [
+      {
+        connectionString,
+        ...(options.max !== undefined ? { max: options.max } : {}),
+        ...(options.idleTimeoutMillis !== undefined
+          ? { idleTimeoutMillis: options.idleTimeoutMillis }
+          : {}),
+        ...(options.connectionTimeoutMillis !== undefined
+          ? { connectionTimeoutMillis: options.connectionTimeoutMillis }
+          : {})
+      }
+    ]);
+    pool.on?.('error', (err) => {
+      options.logger?.error?.('Unexpected error on idle PostgreSQL client', err);
+    });
+    return {
+      pool,
+      query: (sql, params = []) => pool.query(sql, params),
+      close: () => pool.end()
+    };
+  };
+}
+
+const createPgPool = await resolveCreatePgPool();
+const silentPoolLogger = {
+  info() {},
+  debug() {},
+  warn() {},
+  error() {}
+};
 
 export { loadConfig, SCHEMA_VERSION } from './config.js';
 export { ContextBridge } from './context-bridge.js';
@@ -67,7 +125,14 @@ export function createPolygresConnector(options = {}) {
     assertCloudAllowed(config.polygresUrl, config.allowCloud);
     const pool = isEphemeralMode()
       ? createMockPolygresPool()
-      : new pg.Pool({ connectionString: config.polygresUrl });
+      : createPgPool(
+          { connectionString: config.polygresUrl },
+          {
+            serviceName: 'polygres-connector',
+            PoolClass: pg.Pool,
+            logger: silentPoolLogger
+          }
+        ).pool;
     if (typeof pool.on === 'function') {
       pool.on('error', (err) => {
         console.error('[PolygresConnector] Remote pool error:', err.message);

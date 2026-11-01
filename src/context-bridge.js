@@ -7,12 +7,143 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import pg from 'pg';
-import { DatabaseSync } from 'node:sqlite';
+import { DatabaseSync as NodeSqliteDriver } from 'node:sqlite';
 import { assertCloudAllowed, SCHEMA_VERSION, resolvePolygresUrl, isDebugEnabled } from './config.js';
 import { isEphemeralMode, createMockPolygresPool } from './db-mock.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+async function resolveCreatePgPool() {
+  const siblingPgUrl = new URL('../../../lib/pg.js', import.meta.url);
+  if (fs.existsSync(siblingPgUrl)) {
+    try {
+      const mod = await import(siblingPgUrl.href);
+      if (typeof mod.createPgPool === 'function') {
+        return mod.createPgPool;
+      }
+    } catch {
+      // Fall through to @krusch/toolkit/pg or standalone CI fallback
+    }
+  }
+  try {
+    const mod = await import('@krusch/toolkit/pg');
+    if (typeof mod.createPgPool === 'function') {
+      return mod.createPgPool;
+    }
+  } catch {
+    // Standalone CI fallback when sibling toolkit is unavailable
+  }
+  return function standaloneCreatePgPool(dbConfig = {}, options = {}) {
+    const connectionString =
+      typeof dbConfig === 'string'
+        ? dbConfig.trim()
+        : String(dbConfig?.connectionString || dbConfig?.url || '').trim();
+    const PoolCtor = options.PoolClass || pg['Pool'];
+    const pool = Reflect.construct(PoolCtor, [
+      {
+        connectionString,
+        ...(options.max !== undefined ? { max: options.max } : {}),
+        ...(options.idleTimeoutMillis !== undefined
+          ? { idleTimeoutMillis: options.idleTimeoutMillis }
+          : {}),
+        ...(options.connectionTimeoutMillis !== undefined
+          ? { connectionTimeoutMillis: options.connectionTimeoutMillis }
+          : {})
+      }
+    ]);
+    pool.on?.('error', (err) => {
+      options.logger?.error?.('Unexpected error on idle PostgreSQL client', err);
+    });
+    return {
+      pool,
+      query: (sql, params = []) => pool.query(sql, params),
+      close: () => pool.end()
+    };
+  };
+}
+
+async function resolveOpenSqliteDb() {
+  const siblingSqliteUrl = new URL('../../../lib/sqlite.js', import.meta.url);
+  if (fs.existsSync(siblingSqliteUrl)) {
+    try {
+      const mod = await import(siblingSqliteUrl.href);
+      if (typeof mod.openSqliteDb === 'function') {
+        return mod.openSqliteDb;
+      }
+    } catch {
+      // Fall through to @krusch/toolkit/sqlite or standalone CI fallback
+    }
+  }
+  try {
+    const mod = await import('@krusch/toolkit/sqlite');
+    if (typeof mod.openSqliteDb === 'function') {
+      return mod.openSqliteDb;
+    }
+  } catch {
+    // Standalone CI fallback when sibling toolkit is unavailable
+  }
+  return function standaloneOpenSqliteDb(dbPath = ':memory:', options = {}) {
+    const {
+      wal = true,
+      busyTimeout = 5000,
+      synchronous,
+      readOnly = false,
+      foreignKeys = true
+    } = options || {};
+    if (dbPath !== ':memory:' && !String(dbPath).startsWith('file:') && !readOnly) {
+      fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+    }
+    const db = readOnly
+      ? Reflect.construct(NodeSqliteDriver, [dbPath, { readOnly: true }])
+      : Reflect.construct(NodeSqliteDriver, [dbPath]);
+    try {
+      const safeBusy = Number.isFinite(busyTimeout) && busyTimeout >= 0 ? Math.trunc(busyTimeout) : 5000;
+      db.exec(`PRAGMA busy_timeout = ${safeBusy};`);
+      if (!readOnly) {
+        if (wal !== false) {
+          db.exec('PRAGMA journal_mode = WAL;');
+          db.exec(`PRAGMA synchronous = ${synchronous || 'NORMAL'};`);
+        } else if (synchronous) {
+          db.exec(`PRAGMA synchronous = ${synchronous};`);
+        }
+      }
+      db.exec(`PRAGMA foreign_keys = ${foreignKeys === false ? 'OFF' : 'ON'};`);
+    } catch (err) {
+      try {
+        db.close();
+      } catch {
+        // Preserve primary error
+      }
+      throw err;
+    }
+    let closed = false;
+    return {
+      db,
+      dbPath,
+      isOpen: () => !closed,
+      exec: (sql) => db.exec(sql),
+      close: () => {
+        if (closed) return;
+        closed = true;
+        db.close();
+      }
+    };
+  };
+}
+
+const createPgPool = await resolveCreatePgPool();
+const openSqliteDb = await resolveOpenSqliteDb();
+const contextPoolLogger = {
+  info() {},
+  debug() {},
+  warn() {},
+  error(_msg, err) {
+    if (process.env.KRUSCH_DEBUG) {
+      console.error('[ContextBridge] Idle PostgreSQL client error:', err?.message || err);
+    }
+  }
+};
 
 export const SENSITIVE_PATTERNS = [
   /sk-[a-zA-Z0-9_-]{20,}/g,                                      // OpenAI / OpenRouter / Anthropic keys
@@ -107,7 +238,14 @@ export class ContextBridge {
       assertCloudAllowed(this.polygresUrl, this.allowCloud);
       this.pool = isEphemeralMode()
         ? createMockPolygresPool()
-        : new pg.Pool({ connectionString: this.polygresUrl });
+        : createPgPool(
+            { connectionString: this.polygresUrl },
+            {
+              serviceName: 'polygres-context',
+              PoolClass: pg.Pool,
+              logger: contextPoolLogger
+            }
+          ).pool;
       this.ownsPool = true;
     }
     return this.pool;
@@ -178,9 +316,10 @@ export class ContextBridge {
       return [];
     }
 
-    let db;
+    let sqliteHandle;
     try {
-      db = new DatabaseSync(this.contextDbPath);
+      sqliteHandle = openSqliteDb(this.contextDbPath, { wal: false, foreignKeys: false });
+      const db = sqliteHandle.db;
       // Check which table exists: ide_agent_memory or context_items
       const tableCheck = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('ide_agent_memory', 'context_items')").all();
       const tableNames = new Set(tableCheck.map(t => t.name));
@@ -215,9 +354,9 @@ export class ContextBridge {
     } catch (err) {
       throw new Error(`[ContextBridge] Local SQLite database at '${this.contextDbPath}' corrupt or unreadable: ${err.message}`);
     } finally {
-      if (db) {
+      if (sqliteHandle) {
         try {
-          db.close();
+          sqliteHandle.close();
         } catch (closeErr) {
           if (this.debug) {
             console.warn(`[ContextBridge] db.close() warning: ${closeErr.message}`);
@@ -235,7 +374,8 @@ export class ContextBridge {
       fs.mkdirSync(path.dirname(this.contextDbPath), { recursive: true });
     }
 
-    const db = new DatabaseSync(this.contextDbPath);
+    const sqliteHandle = openSqliteDb(this.contextDbPath, { wal: false, foreignKeys: false });
+    const db = sqliteHandle.db;
     try {
       // Ensure local schema exists
       db.exec(`
@@ -281,7 +421,7 @@ export class ContextBridge {
 
       return writtenCount;
     } finally {
-      db.close();
+      sqliteHandle.close();
     }
   }
 

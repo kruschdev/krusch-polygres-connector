@@ -16,6 +16,67 @@ import { isEphemeralMode, createMockPolygresPool } from './db-mock.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+async function resolveCreatePgPool() {
+  const siblingPgUrl = new URL('../../../lib/pg.js', import.meta.url);
+  if (fs.existsSync(siblingPgUrl)) {
+    try {
+      const mod = await import(siblingPgUrl.href);
+      if (typeof mod.createPgPool === 'function') {
+        return mod.createPgPool;
+      }
+    } catch {
+      // Fall through to @krusch/toolkit/pg or standalone CI fallback
+    }
+  }
+  try {
+    const mod = await import('@krusch/toolkit/pg');
+    if (typeof mod.createPgPool === 'function') {
+      return mod.createPgPool;
+    }
+  } catch {
+    // Standalone CI fallback when sibling toolkit is unavailable
+  }
+  return function standaloneCreatePgPool(dbConfig = {}, options = {}) {
+    const connectionString =
+      typeof dbConfig === 'string'
+        ? dbConfig.trim()
+        : String(dbConfig?.connectionString || dbConfig?.url || '').trim();
+    const PoolCtor = options.PoolClass || pg['Pool'];
+    const pool = Reflect.construct(PoolCtor, [
+      {
+        connectionString,
+        ...(options.max !== undefined ? { max: options.max } : {}),
+        ...(options.idleTimeoutMillis !== undefined
+          ? { idleTimeoutMillis: options.idleTimeoutMillis }
+          : {}),
+        ...(options.connectionTimeoutMillis !== undefined
+          ? { connectionTimeoutMillis: options.connectionTimeoutMillis }
+          : {})
+      }
+    ]);
+    pool.on?.('error', (err) => {
+      options.logger?.error?.('Unexpected error on idle PostgreSQL client', err);
+    });
+    return {
+      pool,
+      query: (sql, params = []) => pool.query(sql, params),
+      close: () => pool.end()
+    };
+  };
+}
+
+const createPgPool = await resolveCreatePgPool();
+const gitPoolLogger = {
+  info() {},
+  debug() {},
+  warn() {},
+  error(_msg, err) {
+    if (process.env.KRUSCH_DEBUG) {
+      console.error('[GitBridge] Idle PostgreSQL client error:', err?.message || err);
+    }
+  }
+};
+
 export class GitBridge {
   constructor(config = {}) {
     this.localDbUrl = config.localGitDbUrl !== undefined
@@ -41,7 +102,14 @@ export class GitBridge {
       }
       this.localPool = isEphemeralMode()
         ? createMockPolygresPool()
-        : new pg.Pool({ connectionString: this.localDbUrl });
+        : createPgPool(
+            { connectionString: this.localDbUrl },
+            {
+              serviceName: 'polygres-git-local',
+              PoolClass: pg.Pool,
+              logger: gitPoolLogger
+            }
+          ).pool;
     }
     return this.localPool;
   }
@@ -54,7 +122,14 @@ export class GitBridge {
       assertCloudAllowed(this.polygresUrl, this.allowCloud);
       this.remotePool = isEphemeralMode()
         ? createMockPolygresPool()
-        : new pg.Pool({ connectionString: this.polygresUrl });
+        : createPgPool(
+            { connectionString: this.polygresUrl },
+            {
+              serviceName: 'polygres-git-remote',
+              PoolClass: pg.Pool,
+              logger: gitPoolLogger
+            }
+          ).pool;
       this.ownsRemotePool = true;
     }
     return this.remotePool;

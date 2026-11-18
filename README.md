@@ -33,10 +33,37 @@ This connector writes standard PostgreSQL tables compatible with Polygres-hosted
 
 ---
 
-## 🚀 Installation & Usage
+## ⚡ Quick Start
+
+### Agent-Assisted Setup
+
+Ask your coding agent (Claude Code, Codex, Cursor, Windsurf, or Antigravity):
+
+```text
+Read https://raw.githubusercontent.com/kruschdev/krusch-polygres-connector/main/INSTALL.md and set up krusch-polygres-connector on this machine.
+```
+
+### Manual Installation & Offline Verification (Node.js `>= 22.5.0`)
+
+Install from GitHub into an existing Node.js 22+ project (uses built-in `node:sqlite` + `pg`):
 
 ```bash
-npm install -g @krusch/polygres-connector
+npm install github:kruschdev/krusch-polygres-connector
+```
+
+Or clone standalone and verify offline in hermetic ephemeral mode (`KRUSCH_EPHEMERAL=1`, zero database servers or cloud keys needed):
+
+```bash
+git clone https://github.com/kruschdev/krusch-polygres-connector.git
+cd krusch-polygres-connector
+npm install
+KRUSCH_EPHEMERAL=1 node ./bin/krusch-polygres.js status --json
+```
+
+When connecting to a live PostgreSQL or Polygres Cloud database, apply the idempotent schema once:
+
+```bash
+psql "$POLYGRES_URL" -f sql/schema_v1.sql
 ```
 
 ### Environment Configuration
@@ -100,6 +127,24 @@ krusch-polygres sync-git <repo_name> [commit_sha] [--dry-run] [--json]
 
 # Authoritative exact AST symbol lookup
 krusch-polygres find-symbol <repo_name> <symbol_name> [--json]
+
+# Combine AST symbol, caller/callee CTE, and active KruschContext steering invariants
+krusch-polygres symbol-context <repo_name> <symbol_name> [workspace] [--json]
+
+# Walk recursive caller-callee dependency graph via CTE
+krusch-polygres dep-graph <repo_name> <symbol_name> [--json]
+
+# Trace transitive caller blast radius decorated with attached invariants
+krusch-polygres blast-radius <repo_name> <symbol_name> [workspace] [--json]
+
+# Audit proposed symbol mutation or rename against callers and active blockers
+krusch-polygres audit-refactor <repo_name> <symbol_name> [action] [workspace] [--json]
+
+# Relational SQL JOIN between pg_git_symbols and pg_context_items
+krusch-polygres cross-query <repo_name> [workspace] [--json]
+
+# Index codebase blobs to a Wondersearch drive
+krusch-polygres sync-code <repo_name> [commit_sha] [--dry-run] [--json]
 
 # Search codebase passages via Wondersearch
 krusch-polygres search-code <repo_name> <query> [--json]
